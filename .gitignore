@@ -1,0 +1,74 @@
+############################
+# Python
+############################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environnements virtuels
+venv/
+.env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+############################
+# Données (TRÈS IMPORTANT)
+############################
+data/
+outputs/
+results/
+runs/
+
+# Rasters / géospatial
+*.tif
+*.tiff
+*.vrt
+*.img
+*.jp2
+*.aux.xml
+*.ovr
+
+# Vecteurs
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+
+# Tables volumineuses
+*.csv
+*.parquet
+*.feather
+
+############################
+# Logs / temporaires
+############################
+*.log
+*.tmp
+*.temp
+.cache/
+tmp/
+
+############################
+# OS / IDE
+############################
+.DS_Store
+Thumbs.db
+
+.vscode/
+.idea/
+
+############################
+# Secrets / config locale
+############################
+.env
+.env.local
+config_local.py

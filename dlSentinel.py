@@ -1,16 +1,21 @@
 import os
 from collections import defaultdict
+from datetime import datetime, date, timedelta
+
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import shape
 from shapely.errors import GEOSException
+
 from pystac_client import Client
 import planetary_computer as pc
+
 import rasterio
 from rasterio.windows import from_bounds
-from rasterio.warp import transform_bounds
-from rasterstats import zonal_stats
+from rasterio.warp import transform_bounds, reproject, Resampling
+from rasterio.features import rasterize
+
 
 # =========================
 # CONFIG
@@ -18,21 +23,51 @@ from rasterstats import zonal_stats
 GPKG_PATH = "Parcelles-Herault.gpkg"
 ID_COL = "ID_PARCEL"
 
-OUTROOT = "data/s2_herault_tiles_march_v3"
+OUTROOT = "data/s2_herault_2024_full"
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 COLLECTION = "sentinel-2-l2a"
 
-START, END = "2023-03-01", "2023-03-31"
-MAX_CLOUD = 30
+START, END = "2024-01-01", "2024-12-31"
 
-BANDS_NDVI = ["B04", "B08"]
-NDVI_NODATA = -9999.0
+# Sur l'année entière, monter le seuil nuageux est utile (sinon hiver = rien).
+MAX_CLOUD = 80
+
+# Fenêtrage temporel (aligné revisite)
+WINDOW_DAYS = 5          # 5 jours recommandé
+TOP_K_PER_WINDOW = 1     # 1 scène par fenêtre (tu peux mettre 2 si tu veux plus dense)
+
+# Bandes nécessaires + SCL (masque nuages)
+# Indices: NDVI (B04,B08), NDMI (B08,B11), NDWI (B03,B08), EVI (B02,B04,B08)
+BANDS = ["B02", "B03", "B04", "B08", "B11", "SCL"]
+
+IDX_NODATA = -9999.0
 PAD_DEG = 0.0
+MIN_PX_COUNT = 10   # filtrage qualité (0 = tout garder)
+
+# SCL classes à masquer (nuages/ombres/neige/nodata)
+# SCL classes (ESA):
+# 0 No data, 1 Saturated/defective, 2 Dark features, 3 Cloud shadows,
+# 4 Vegetation, 5 Bare soils, 6 Water, 7 Unclassified,
+# 8 Cloud med prob, 9 Cloud high prob, 10 Thin cirrus, 11 Snow/ice
+SCL_MASK_VALUES = {0, 1, 3, 8, 9, 10, 11}
 
 os.makedirs(OUTROOT, exist_ok=True)
 
+
 # =========================
-# 1) Charger parcelles
+# Utils dates
+# =========================
+def parse_date(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+def window_start(d: date, start_date: date, window_days: int) -> date:
+    delta = (d - start_date).days
+    k = (delta // window_days) * window_days
+    return start_date + timedelta(days=k)
+
+
+# =========================
+# 1) Charger parcelles + fix geom
 # =========================
 gdf = gpd.read_file(GPKG_PATH)
 if gdf.crs is None:
@@ -41,34 +76,27 @@ if ID_COL not in gdf.columns:
     raise ValueError(f"Colonne ID '{ID_COL}' introuvable. Colonnes: {list(gdf.columns)}")
 
 gdf_4326 = gdf.to_crs(4326)
-
-# ---- Réparer géométries invalides (uniquement celles qui le sont) ----
-# (1) enlève les géométries vides
 gdf_4326 = gdf_4326[~gdf_4326.geometry.is_empty & gdf_4326.geometry.notna()].copy()
 
 invalid = ~gdf_4326.geometry.is_valid
 print("Géométries invalides:", int(invalid.sum()), "sur", len(gdf_4326))
-
 if invalid.any():
-    # Buffer(0) uniquement sur invalides
     gdf_4326.loc[invalid, "geometry"] = gdf_4326.loc[invalid, "geometry"].buffer(0)
 
-# Re-check + drop si encore invalides
 invalid2 = ~gdf_4326.geometry.is_valid
 print("Encore invalides après fix:", int(invalid2.sum()))
 if invalid2.any():
     gdf_4326 = gdf_4326.loc[~invalid2].copy()
-    print("Après suppression invalides restantes:", len(gdf_4326))
 
-# bbox département
 minx, miny, maxx, maxy = gdf_4326.total_bounds
 dept_bbox_4326 = (minx, miny, maxx, maxy)
 
 print("Parcelles valides:", len(gdf_4326))
 print("BBox département (4326):", dept_bbox_4326)
 
+
 # =========================
-# 2) Recherche STAC
+# 2) STAC search (2024 entier)
 # =========================
 catalog = Client.open(STAC_URL)
 search = catalog.search(
@@ -77,13 +105,14 @@ search = catalog.search(
     datetime=f"{START}/{END}",
     query={"eo:cloud_cover": {"lt": MAX_CLOUD}},
 )
-items = list(search.get_items())
+items = list(search.items())
 print(f"\nNb items S2 L2A trouvés ({START}→{END}, cloud<{MAX_CLOUD}%): {len(items)}")
 if not items:
     raise RuntimeError("Aucun item trouvé. Augmente MAX_CLOUD ou élargis la période.")
 
+
 # =========================
-# 3) Grouper par tuile MGRS
+# 3) Grouper par tuile
 # =========================
 by_tile = defaultdict(list)
 for it in items:
@@ -94,38 +123,22 @@ for it in items:
 tiles = sorted(by_tile.keys())
 print("Tuiles MGRS détectées:", tiles)
 
-# =========================
-# 4) Best item par tuile (nuages min)
-# =========================
-best_per_tile = {}
-for tile, its in by_tile.items():
-    its_sorted = sorted(its, key=lambda it: it.properties.get("eo:cloud_cover", 100.0))
-    best = its_sorted[0]
-    best_per_tile[tile] = best
-    print(f"Tile {tile}: best date={best.datetime.date()} cloud={best.properties.get('eo:cloud_cover', 100.0):.1f}% id={best.id}")
 
 # =========================
-# 5) Fonctions
+# 4) Fonctions footprint + sélection coverage-first
 # =========================
 def parcels_in_item_footprint(gdf_4326, item, pad_deg=0.0):
-    """
-    Filtre les parcelles qui intersectent le footprint réel (item.geometry).
-    On utilise sindex pour accélérer + on gère les GEOSException.
-    """
     foot = shape(item.geometry)
 
-    # accélération: pré-filtre via bounding box du footprint
+    # préfiltre bbox
     minx, miny, maxx, maxy = foot.bounds
     cand = gdf_4326.cx[minx:maxx, miny:maxy]
-
     if cand.empty:
         return None, None
 
-    # intersects robuste (au cas où)
     try:
         sub = cand[cand.intersects(foot)].copy()
     except GEOSException:
-        # fallback: buffer(0) sur un petit sous-ensemble candidat, puis intersects
         cand2 = cand.copy()
         bad = ~cand2.geometry.is_valid
         if bad.any():
@@ -142,6 +155,63 @@ def parcels_in_item_footprint(gdf_4326, item, pad_deg=0.0):
 
     return (minx2, miny2, maxx2, maxy2), sub
 
+
+def coverage_count(gdf_4326, item):
+    _, sub = parcels_in_item_footprint(gdf_4326, item, pad_deg=0.0)
+    return 0 if sub is None else int(len(sub))
+
+
+def pick_best_items_coverage_first(gdf_4326, candidates, top_k=1):
+    """
+    Retourne top_k items triés par:
+      1) couverture (nb parcelles intersectées) décroissant
+      2) cloud_cover croissant
+    """
+    scored = []
+    for it in candidates:
+        cov = coverage_count(gdf_4326, it)
+        if cov <= 0:
+            continue
+        cc = float(it.properties.get("eo:cloud_cover", 100.0))
+        scored.append((cov, cc, it))
+    if not scored:
+        return []
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [x[2] for x in scored[:top_k]]
+
+
+# =========================
+# 5) Sélection: par tuile + fenêtre 5 jours (coverage-first, cloud-second)
+# =========================
+start_date = parse_date(START)
+end_date = parse_date(END)
+
+selected = defaultdict(list)  # tile -> list(items sélectionnés)
+
+for tile, its in by_tile.items():
+    # regroupe par fenêtre
+    bins = defaultdict(list)
+    for it in its:
+        d = it.datetime.date()
+        ws = window_start(d, start_date, WINDOW_DAYS)
+        bins[ws].append(it)
+
+    print(f"\nTile {tile}: {len(its)} items -> {len(bins)} fenêtres de {WINDOW_DAYS} jours")
+    for ws, cand in sorted(bins.items(), key=lambda kv: kv[0]):
+        picked = pick_best_items_coverage_first(gdf_4326, cand, top_k=TOP_K_PER_WINDOW)
+        for it in picked:
+            selected[tile].append(it)
+
+    print(f"  -> sélectionnés: {len(selected[tile])} items")
+
+# résumé
+total_sel = sum(len(v) for v in selected.values())
+print(f"\nTotal items sélectionnés (toutes tuiles): {total_sel}")
+
+
+# =========================
+# 6) Download + crop + align + indices + zonal fast (multi-indices)
+# =========================
 def download_crop_band(href, out_path, bbox4326):
     signed = pc.sign(href)
     with rasterio.open(signed) as src:
@@ -174,105 +244,265 @@ def download_crop_band(href, out_path, bbox4326):
             dst.write(data, 1)
     return out_path
 
-def pct_nonzero(path):
-    with rasterio.open(path) as src:
-        a = src.read(1)
-    return 100.0 * float(np.mean(a != 0))
 
-def compute_ndvi(b08_path, b04_path, out_path, nodata_val=-9999.0):
-    with rasterio.open(b08_path) as s8, rasterio.open(b04_path) as s4:
-        nir = s8.read(1).astype("float32")
-        red = s4.read(1).astype("float32")
-        ndvi = (nir - red) / (nir + red + 1e-6)
+def align_to_ref(src_path, ref_path, out_path, resampling=Resampling.nearest):
+    """
+    Reprojette/resample src sur la grille de ref (même crs/transform/shape).
+    Utile pour B11(20m) et SCL(20m) -> grille B08(10m).
+    """
+    with rasterio.open(ref_path) as ref:
+        dst_crs = ref.crs
+        dst_transform = ref.transform
+        dst_h, dst_w = ref.height, ref.width
+        dst_profile = ref.profile.copy()
+        dst_profile.update(count=1, dtype="float32")
 
-        # nodata là où nir & red sont nodata (=0)
-        mask = (nir == 0) & (red == 0)
-        ndvi[mask] = nodata_val
+    with rasterio.open(src_path) as src:
+        src_arr = src.read(1)
+        dst_arr = np.zeros((dst_h, dst_w), dtype=np.float32)
 
-        profile = s8.profile.copy()
-        profile.update(dtype="float32", count=1, nodata=nodata_val, compress="deflate")
+        reproject(
+            source=src_arr,
+            destination=dst_arr,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            resampling=resampling,
+        )
 
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with rasterio.open(out_path, "w", **profile) as dst:
-            dst.write(ndvi.astype("float32"), 1)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with rasterio.open(out_path, "w", **dst_profile) as dst:
+        dst.write(dst_arr.astype(np.float32), 1)
+
     return out_path
 
+
+def write_index(out_path, ref_path, arr_float32, nodata_val=IDX_NODATA):
+    with rasterio.open(ref_path) as ref:
+        profile = ref.profile.copy()
+        profile.update(dtype="float32", count=1, nodata=nodata_val, compress="deflate")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(arr_float32.astype(np.float32), 1)
+    return out_path
+
+
+def compute_indices_with_scl(band_paths, out_dir, nodata_val=IDX_NODATA):
+    """
+    Calcule NDVI, NDMI, NDWI, EVI sur la grille B08 (10m),
+    en masquant nuages via SCL (reprojetté sur B08).
+    """
+    b02 = band_paths["B02"]
+    b03 = band_paths["B03"]
+    b04 = band_paths["B04"]
+    b08 = band_paths["B08"]
+    b11 = band_paths["B11"]
+    scl = band_paths["SCL"]
+
+    # align B11 & SCL -> grille B08 (10m)
+    b11_10m = os.path.join(out_dir, "B11_10m.tif")
+    if not os.path.exists(b11_10m):
+        align_to_ref(b11, b08, b11_10m, resampling=Resampling.nearest)
+
+    scl_10m = os.path.join(out_dir, "SCL_10m.tif")
+    if not os.path.exists(scl_10m):
+        # nearest obligatoire pour classes
+        align_to_ref(scl, b08, scl_10m, resampling=Resampling.nearest)
+
+    # lire bandes
+    with rasterio.open(b08) as s8: nir = s8.read(1).astype(np.float32)
+    with rasterio.open(b04) as s4: red = s4.read(1).astype(np.float32)
+    with rasterio.open(b03) as s3: green = s3.read(1).astype(np.float32)
+    with rasterio.open(b02) as s2: blue = s2.read(1).astype(np.float32)
+    with rasterio.open(b11_10m) as s11: swir = s11.read(1).astype(np.float32)
+    with rasterio.open(scl_10m) as sscl: scl_arr = sscl.read(1).astype(np.int16)
+
+    # masques
+    m0 = (nir == 0) & (red == 0)
+    mcloud = np.isin(scl_arr, np.array(list(SCL_MASK_VALUES), dtype=np.int16))
+    mmask = m0 | mcloud
+
+    # indices
+    ndvi = (nir - red) / (nir + red + 1e-6)
+    ndmi = (nir - swir) / (nir + swir + 1e-6)
+    ndwi = (green - nir) / (green + nir + 1e-6)
+    evi  = 2.5 * (nir - red) / (nir + 6.0 * red - 7.5 * blue + 1.0 + 1e-6)
+
+    # nodata
+    for a in (ndvi, ndmi, ndwi, evi):
+        a[mmask] = nodata_val
+
+    out = {}
+    out["NDVI"] = write_index(os.path.join(out_dir, "NDVI.tif"), b08, ndvi, nodata_val)
+    out["NDMI"] = write_index(os.path.join(out_dir, "NDMI.tif"), b08, ndmi, nodata_val)
+    out["NDWI"] = write_index(os.path.join(out_dir, "NDWI.tif"), b08, ndwi, nodata_val)
+    out["EVI"]  = write_index(os.path.join(out_dir, "EVI.tif"),  b08, evi,  nodata_val)
+    return out
+
+
+def fast_zonal_multi_mean_count(parcels_gdf, parcels_id_col, raster_paths_dict, nodata_val, progress_every=80):
+    """
+    FAST zonal stats pour plusieurs rasters (mean+count) en UNE seule passe.
+    - rasterize une fois les parcelles
+    - parcourt les blocks et accumulate sum/count pour chaque index
+    Retourne df: ID, <idx>_mean, <idx>_count
+    """
+    idx_names = list(raster_paths_dict.keys())
+    paths = [raster_paths_dict[k] for k in idx_names]
+
+    # On prend le 1er raster comme référence grille/blocks
+    with rasterio.open(paths[0]) as ref:
+        transform = ref.transform
+        out_shape = (ref.height, ref.width)
+        block_windows = list(ref.block_windows(1))
+
+    parcels = parcels_gdf[[parcels_id_col, "geometry"]].copy().reset_index(drop=True)
+    ids = parcels[parcels_id_col].astype(str).values
+    int_ids = np.arange(1, len(parcels) + 1, dtype=np.int32)
+
+    print("    Rasterize parcels -> label raster...")
+    shapes = [(geom, int(i)) for geom, i in zip(parcels.geometry.values, int_ids)]
+    lab = rasterize(
+        shapes=shapes,
+        out_shape=out_shape,
+        transform=transform,
+        fill=0,
+        all_touched=False,
+        dtype="int32",
+    )
+
+    # accumulateurs par index
+    sums = {k: np.zeros(len(parcels) + 1, dtype=np.float64) for k in idx_names}
+    counts = {k: np.zeros(len(parcels) + 1, dtype=np.int64) for k in idx_names}
+
+    # ouvrir tous les rasters
+    srcs = [rasterio.open(p) for p in paths]
+    try:
+        print("    Accumulate mean/count by blocks (multi-indices)...")
+        for bi, (_, win) in enumerate(block_windows, start=1):
+            lab_w = lab[win.row_off:win.row_off + win.height, win.col_off:win.col_off + win.width]
+            if not np.any(lab_w > 0):
+                if progress_every and bi % progress_every == 0:
+                    print(f"      blocks processed: {bi}")
+                continue
+
+            for idx_name, src in zip(idx_names, srcs):
+                data = src.read(1, window=win).astype(np.float32)
+                m = (lab_w > 0) & (data != nodata_val)
+                if np.any(m):
+                    pid = lab_w[m].astype(np.int32)
+                    val = data[m].astype(np.float32)
+                    counts[idx_name] += np.bincount(pid, minlength=counts[idx_name].size)
+                    sums[idx_name] += np.bincount(pid, weights=val, minlength=sums[idx_name].size)
+
+            if progress_every and bi % progress_every == 0:
+                print(f"      blocks processed: {bi}")
+
+    finally:
+        for s in srcs:
+            s.close()
+
+    # construire df
+    out = pd.DataFrame({parcels_id_col: ids})
+    for idx_name in idx_names:
+        mean = np.full(len(parcels) + 1, np.nan, dtype=np.float64)
+        ok = counts[idx_name] > 0
+        mean[ok] = sums[idx_name][ok] / counts[idx_name][ok]
+        out[f"{idx_name.lower()}_mean"] = mean[1:]
+        out[f"{idx_name.lower()}_count"] = counts[idx_name][1:]
+
+    return out
+
+
 # =========================
-# 6) Boucle par tuile + stats
+# 7) Traitement principal
 # =========================
 rows = []
 
-for tile, it in best_per_tile.items():
-    date_str = it.datetime.date().isoformat()
-    cloud = float(it.properties.get("eo:cloud_cover", 100.0))
+for tile, its in selected.items():
+    print(f"\n===== PROCESS TILE {tile}: {len(its)} dates sélectionnées =====")
+    its_sorted = sorted(its, key=lambda it: it.datetime)
 
-    print(f"\n=== TILE {tile} | date={date_str} cloud={cloud:.1f}% ===")
+    for it in its_sorted:
+        d = it.datetime.date().isoformat()
+        cloud = float(it.properties.get("eo:cloud_cover", 100.0))
+        item_id = it.id
 
-    crop_bbox, parcels_tile = parcels_in_item_footprint(gdf_4326, it, pad_deg=PAD_DEG)
-    if crop_bbox is None:
-        print("Aucune parcelle intersecte le footprint réel -> skip.")
-        continue
+        # footprint -> parcelles + bbox crop
+        crop_bbox, parcels_tile = parcels_in_item_footprint(gdf_4326, it, pad_deg=PAD_DEG)
+        if crop_bbox is None:
+            continue
 
-    print("Nb parcelles footprint:", len(parcels_tile))
-    print("Crop bbox:", crop_bbox)
+        out_dir = os.path.join(OUTROOT, f"{d}_{tile}")
+        os.makedirs(out_dir, exist_ok=True)
 
-    out_dir = os.path.join(OUTROOT, f"{date_str}_{tile}")
-    os.makedirs(out_dir, exist_ok=True)
+        print(f"\n--- {tile} | {d} | cloud={cloud:.1f}% | parcels={len(parcels_tile)} ---")
 
-    out_paths = {}
-    for b in BANDS_NDVI:
-        out_path = os.path.join(out_dir, f"{b}.tif")
-        if not os.path.exists(out_path):
-            p = download_crop_band(it.assets[b].href, out_path, crop_bbox)
-            if p is None:
-                print(f"  - {b}: pas d'intersection -> skip tile")
-                out_paths = {}
+        # download + crop bandes
+        band_paths = {}
+        ok = True
+        for b in BANDS:
+            if b not in it.assets:
+                print(f"  ⚠️ Asset manquant {b} pour {item_id} -> skip")
+                ok = False
                 break
-        out_paths[b] = out_path
-        print(f"  - {b}: nonzero={pct_nonzero(out_path):.2f}%")
+            out_path = os.path.join(out_dir, f"{b}.tif")
+            if not os.path.exists(out_path):
+                p = download_crop_band(it.assets[b].href, out_path, crop_bbox)
+                if p is None:
+                    ok = False
+                    break
+            band_paths[b] = out_path
 
-    if not out_paths:
-        continue
+        if not ok:
+            continue
 
-    ndvi_path = os.path.join(out_dir, "NDVI.tif")
-    if not os.path.exists(ndvi_path):
-        compute_ndvi(out_paths["B08"], out_paths["B04"], ndvi_path, nodata_val=NDVI_NODATA)
-    print("  - NDVI:", ndvi_path)
+        # indices + mask nuages via SCL
+        idx_paths = compute_indices_with_scl(band_paths, out_dir, nodata_val=IDX_NODATA)
+        print("  Indices:", ", ".join(idx_paths.keys()))
 
-    # zonal stats
-    with rasterio.open(ndvi_path) as src:
-        ndvi_crs = src.crs
+        # reproj parcelles au CRS (B08)
+        with rasterio.open(band_paths["B08"]) as src:
+            crs_ref = src.crs
+        parcels_tile_r = parcels_tile.to_crs(crs_ref)
 
-    parcels_tile_r = parcels_tile.to_crs(ndvi_crs)
+        # zonal fast multi-indices
+        df_stats = fast_zonal_multi_mean_count(
+            parcels_tile_r,
+            parcels_id_col=ID_COL,
+            raster_paths_dict=idx_paths,
+            nodata_val=IDX_NODATA,
+            progress_every=100
+        )
 
-    zs = zonal_stats(
-        parcels_tile_r.geometry,
-        ndvi_path,
-        stats=["mean", "median", "count"],
-        nodata=NDVI_NODATA,
-        all_touched=False,
-    )
+        # filtrage qualité (au moins MIN_PX_COUNT sur NDVI, par exemple)
+        if MIN_PX_COUNT > 0:
+            df_stats = df_stats[df_stats["ndvi_count"].fillna(0) >= MIN_PX_COUNT].copy()
 
-    for pid, s in zip(parcels_tile_r[ID_COL].values, zs):
-        rows.append({
-            "date": date_str,
-            "tile": tile,
-            ID_COL: pid,
-            "ndvi_mean": s.get("mean"),
-            "ndvi_median": s.get("median"),
-            "px_count": s.get("count"),
-            "cloud_scene": cloud,
-        })
+        # export format long (comme tu fais déjà)
+        # une ligne par (parcelle, date, indice)
+        for _, r in df_stats.iterrows():
+            pid = r[ID_COL]
+            for idx_name in ["NDVI", "NDMI", "NDWI", "EVI"]:
+                rows.append({
+                    "date": d,
+                    "tile": tile,
+                    ID_COL: pid,
+                    "index": idx_name,
+                    "value_mean": r[f"{idx_name.lower()}_mean"],
+                    "px_count": int(r[f"{idx_name.lower()}_count"]),
+                    "cloud_scene": cloud,
+                })
 
 # =========================
-# 7) Export CSV
+# 8) Export CSV final
 # =========================
 df = pd.DataFrame(rows)
-out_csv = os.path.join(OUTROOT, f"ndvi_parcelles_{START}_{END}.csv")
+out_csv = os.path.join(OUTROOT, f"indices_parcelles_{START}_{END}_win{WINDOW_DAYS}d.csv")
 df.to_csv(out_csv, index=False)
 
 print("\n✅ CSV écrit:", out_csv)
 print("Nb lignes:", len(df))
 if len(df):
     print(df.head())
-    print("px_count==0:", int((df["px_count"].fillna(0) == 0).sum()))
