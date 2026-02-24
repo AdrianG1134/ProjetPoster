@@ -1,6 +1,6 @@
-############################
+﻿# ============================
 # Python
-############################
+# ============================
 __pycache__/
 *.py[cod]
 *.pyo
@@ -11,23 +11,55 @@ __pycache__/
 build/
 dist/
 
-# Environnements virtuels
+# Virtual environments
 venv/
-.env/
 .venv/
+.env/
 
 # Jupyter
 .ipynb_checkpoints/
 
-############################
-# Données (TRÈS IMPORTANT)
-############################
+# ============================
+# OS / IDE
+# ============================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ============================
+# Logs / temp / caches
+# ============================
+*.log
+*.tmp
+*.temp
+.cache/
+tmp/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ============================
+# Local secrets / machine config
+# ============================
+.env
+.env.local
+config_local.py
+
+# ============================
+# Project data (large local files)
+# ============================
 data/
 outputs/
+outputs_xgboost/
 results/
 runs/
 
-# Rasters / géospatial
+# Current local datasets in this repo
+export.csv
+Parcelles-Herault.gpkg
+
+# Geospatial raster/vector large files
 *.tif
 *.tiff
 *.vrt
@@ -35,40 +67,18 @@ runs/
 *.jp2
 *.aux.xml
 *.ovr
-
-# Vecteurs
 *.shp
 *.shx
 *.dbf
 *.prj
 *.cpg
+*.gpkg
 
-# Tables volumineuses
-*.csv
-*.parquet
-*.feather
-
-############################
-# Logs / temporaires
-############################
-*.log
-*.tmp
-*.temp
-.cache/
-tmp/
-
-############################
-# OS / IDE
-############################
-.DS_Store
-Thumbs.db
-
-.vscode/
-.idea/
-
-############################
-# Secrets / config locale
-############################
-.env
-.env.local
-config_local.py
+# Optional ML tracking / artifacts
+mlruns/
+wandb/
+checkpoints/
+models/
+*.joblib
+*.pkl
+*.onnx
