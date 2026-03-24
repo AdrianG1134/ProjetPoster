@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $csv = "data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_and_group_min200.csv"
-$outRoot = "outputs_transformer/overnight_rare_aug_cv"
+$outRoot = "outputs_transformer/rare_aug_cv_experiments"
 
 $baseArgs = @(
   "--csv-path", $csv,
@@ -55,5 +55,5 @@ $rows = Get-ChildItem "$outRoot" -Recurse -Filter test_metrics.json | ForEach-Ob
   }
 }
 $rows | Sort-Object test_macro_f1 -Descending | Format-Table -AutoSize
-$rows | Sort-Object test_macro_f1 -Descending | Export-Csv (Join-Path $outRoot "overnight_summary.csv") -NoTypeInformation
-Write-Host "[OK] Summary saved to $outRoot/overnight_summary.csv"
+$rows | Sort-Object test_macro_f1 -Descending | Export-Csv (Join-Path $outRoot "summary.csv") -NoTypeInformation
+Write-Host "[OK] Summary saved to $outRoot/summary.csv"

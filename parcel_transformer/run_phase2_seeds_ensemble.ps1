@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $csv = "data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_and_group_min200.csv"
-$outRoot = "outputs_transformer/overnight_phase2_seeds"
+$outRoot = "outputs_transformer/phase2_seeds_ensemble"
 $seeds = @(42, 123, 777)
 
 $commonArgs = @(

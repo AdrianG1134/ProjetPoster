@@ -103,7 +103,7 @@ python parcel_transformer/evaluate_ensemble.py --checkpoint-glob "outputs_transf
 
 ## Distillation d'un ensemble vers un seul modele
 ```bash
-python parcel_transformer/distill_ensemble.py --teacher-checkpoint-glob "outputs_transformer/overnight_phase2_seeds/s*/temporal_transformer_*/best_model.pt" --csv-path data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_and_group_min200.csv --split-method tile --index-filter NDVI,NDMI,NDWI,EVI --standardize-features --class-weighting --class-weight-power 0.5 --epochs 60 --batch-size 64 --lr 7e-4 --hard-label-weight 0.4 --temperature 2.0 --output-dir outputs_transformer/distill_phase2_ensemble
+python parcel_transformer/distill_ensemble.py --teacher-checkpoint-glob "outputs_transformer/phase2_seeds_ensemble/s*/temporal_transformer_*/best_model.pt" --csv-path data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_and_group_min200.csv --split-method tile --index-filter NDVI,NDMI,NDWI,EVI --standardize-features --class-weighting --class-weight-power 0.5 --epochs 60 --batch-size 64 --lr 7e-4 --hard-label-weight 0.4 --temperature 2.0 --output-dir outputs_transformer/distill_phase2_ensemble
 ```
 
 ## Mini sweep automatique des losses
@@ -116,12 +116,12 @@ python parcel_transformer/sweep_loss_strategies.py --csv-path data/s2_herault_20
 python parcel_transformer/spatial_cv_groupkfold.py --csv-path data/mon_csv_long.csv --index-filter NDVI,NDMI,NDWI,EVI --n-splits 5 --val-size 0.1 --seed 42 --train-extra-args "--loss-type focal --focal-gamma 1.5 --class-weighting --class-weight-power 0.5 --standardize-features --no-use-group-task"
 ```
 
-## Lancement overnight (PowerShell, tout enchaine)
+## Lancement automatise (augmentation + phase 2 + CV spatiale)
 ```powershell
-powershell -ExecutionPolicy Bypass -File parcel_transformer/run_overnight_rare_aug_cv.ps1
+powershell -ExecutionPolicy Bypass -File parcel_transformer/run_rare_aug_cv_experiments.ps1
 ```
 
-## Lancement overnight (phase2 + seeds + ensemble)
+## Lancement automatise (phase 2 + seeds + ensemble)
 ```powershell
-powershell -ExecutionPolicy Bypass -File parcel_transformer/run_overnight_phase2_seeds_ensemble.ps1
+powershell -ExecutionPolicy Bypass -File parcel_transformer/run_phase2_seeds_ensemble.ps1
 ```
