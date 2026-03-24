@@ -51,6 +51,7 @@ config_local.py
 # ============================
 data/
 outputs/
+outputs_transformer/
 outputs_xgboost/
 results/
 runs/
