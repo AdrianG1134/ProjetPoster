@@ -1,0 +1,9 @@
+{
+  "n_samples": 112002,
+  "n_dates": 30,
+  "n_features_per_date": 4,
+  "n_classes": 25,
+  "accuracy": 0.4214990402214187,
+  "macro_f1": 0.2632800875966831,
+  "weighted_f1": 0.47628835003796355
+}

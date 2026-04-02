@@ -1,0 +1,10 @@
+,0
+n_samples,112002
+n_dates,30
+n_indices,4
+n_classes,25
+indices,"['NDVI', 'EVI', 'NDMI', 'NDWI']"
+target_col,CODE_CULTU
+min_class_count,200
+cloud_max,40.0
+px_count_min,10

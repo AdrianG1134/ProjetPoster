@@ -1,0 +1,9 @@
+{
+  "n_samples": 112002,
+  "n_features": 37,
+  "n_classes": 25,
+  "accuracy": 0.5764474800232132,
+  "macro_f1": 0.3057527961473512,
+  "weighted_f1": 0.5562794983263489,
+  "balanced_accuracy": 0.29506335891899194
+}

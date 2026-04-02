@@ -30,7 +30,10 @@ COLLECTION = "sentinel-2-l2a"
 
 START, END = "2024-01-01", "2024-12-31"
 
-# Sur l'année entière, monter le seuil nuageux est utile (sinon hiver = rien).
+# On réduit à 40% car au-delà, les scènes sont peu utiles
+# et causent des erreurs réseau/lecture pour rien.
+# Seuil nuage global pour recuperer assez d'observations annuelles.
+# Les modeles en aval peuvent ensuite filtrer plus strictement (ex. cloud<=40).
 MAX_CLOUD = 80
 
 # Fenêtrage temporel (aligné revisite)
@@ -171,7 +174,10 @@ def parcels_in_item_footprint(gdf_4326, item, pad_deg=0.0):
 
     minx2, miny2, maxx2, maxy2 = sub.total_bounds
     if pad_deg and pad_deg > 0:
-        minx2 -= pad_deg; miny2 -= pad_deg; maxx2 += pad_deg; maxy2 += pad_deg
+        minx2 -= pad_deg
+        miny2 -= pad_deg
+        maxx2 += pad_deg
+        maxy2 += pad_deg
 
     return (minx2, miny2, maxx2, maxy2), sub
 
@@ -209,7 +215,6 @@ end_date = parse_date(END)
 selected = defaultdict(list)  # tile -> list(items sélectionnés)
 
 for tile, its in by_tile.items():
-    # regroupe par fenêtre
     bins = defaultdict(list)
     for it in its:
         d = it.datetime.date()
@@ -224,7 +229,6 @@ for tile, its in by_tile.items():
 
     print(f"  -> sélectionnés: {len(selected[tile])} items")
 
-# résumé
 total_sel = sum(len(v) for v in selected.values())
 print(f"\nTotal items sélectionnés (toutes tuiles): {total_sel}")
 
@@ -234,35 +238,50 @@ print(f"\nTotal items sélectionnés (toutes tuiles): {total_sel}")
 # =========================
 def download_crop_band(href, out_path, bbox4326):
     signed = pc.sign(href)
-    with rasterio.open(signed) as src:
-        bb = transform_bounds("EPSG:4326", src.crs, *bbox4326, densify_pts=21)
-        inter = (
-            max(bb[0], src.bounds.left),
-            max(bb[1], src.bounds.bottom),
-            min(bb[2], src.bounds.right),
-            min(bb[3], src.bounds.top),
-        )
-        if inter[0] >= inter[2] or inter[1] >= inter[3]:
-            return None
 
-        win = from_bounds(*inter, transform=src.transform).round_offsets().round_lengths()
-        data = src.read(1, window=win)
-        transform = src.window_transform(win)
+    try:
+        with rasterio.open(signed) as src:
+            bb = transform_bounds("EPSG:4326", src.crs, *bbox4326, densify_pts=21)
+            inter = (
+                max(bb[0], src.bounds.left),
+                max(bb[1], src.bounds.bottom),
+                min(bb[2], src.bounds.right),
+                min(bb[3], src.bounds.top),
+            )
+            if inter[0] >= inter[2] or inter[1] >= inter[3]:
+                return None
 
-        profile = src.profile.copy()
-        profile.update(
-            height=data.shape[0],
-            width=data.shape[1],
-            transform=transform,
-            compress="deflate",
-            tiled=True,
-            BIGTIFF="IF_SAFER",
-        )
+            win = from_bounds(*inter, transform=src.transform).round_offsets().round_lengths()
 
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with rasterio.open(out_path, "w", **profile) as dst:
-            dst.write(data, 1)
-    return out_path
+            try:
+                data = src.read(1, window=win)
+            except Exception as e:
+                print(f"    ❌ Lecture raster impossible: {signed}")
+                print(f"    Détail: {e}")
+                return None
+
+            transform = src.window_transform(win)
+
+            profile = src.profile.copy()
+            profile.update(
+                height=data.shape[0],
+                width=data.shape[1],
+                transform=transform,
+                compress="deflate",
+                tiled=True,
+                BIGTIFF="IF_SAFER",
+            )
+
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with rasterio.open(out_path, "w", **profile) as dst:
+                dst.write(data, 1)
+
+        return out_path
+
+    except Exception as e:
+        print(f"    ❌ Impossible d'ouvrir/télécharger l'asset : {href}")
+        print(f"    Détail: {e}")
+        return None
 
 
 def align_to_ref(src_path, ref_path, out_path, resampling=Resampling.nearest):
@@ -320,30 +339,31 @@ def compute_indices_with_scl(band_paths, out_dir, nodata_val=IDX_NODATA):
     b11 = band_paths["B11"]
     scl = band_paths["SCL"]
 
-    # align B11 & SCL -> grille B08 (10m)
     b11_10m = os.path.join(out_dir, "B11_10m.tif")
     if not os.path.exists(b11_10m):
         align_to_ref(b11, b08, b11_10m, resampling=Resampling.nearest)
 
     scl_10m = os.path.join(out_dir, "SCL_10m.tif")
     if not os.path.exists(scl_10m):
-        # nearest obligatoire pour classes
         align_to_ref(scl, b08, scl_10m, resampling=Resampling.nearest)
 
-    # lire bandes
-    with rasterio.open(b08) as s8: nir = s8.read(1).astype(np.float32)
-    with rasterio.open(b04) as s4: red = s4.read(1).astype(np.float32)
-    with rasterio.open(b03) as s3: green = s3.read(1).astype(np.float32)
-    with rasterio.open(b02) as s2: blue = s2.read(1).astype(np.float32)
-    with rasterio.open(b11_10m) as s11: swir = s11.read(1).astype(np.float32)
-    with rasterio.open(scl_10m) as sscl: scl_arr = sscl.read(1).astype(np.int16)
+    with rasterio.open(b08) as s8:
+        nir = s8.read(1).astype(np.float32)
+    with rasterio.open(b04) as s4:
+        red = s4.read(1).astype(np.float32)
+    with rasterio.open(b03) as s3:
+        green = s3.read(1).astype(np.float32)
+    with rasterio.open(b02) as s2:
+        blue = s2.read(1).astype(np.float32)
+    with rasterio.open(b11_10m) as s11:
+        swir = s11.read(1).astype(np.float32)
+    with rasterio.open(scl_10m) as sscl:
+        scl_arr = sscl.read(1).astype(np.int16)
 
-    # masques
     m0 = (nir == 0) & (red == 0)
     mcloud = np.isin(scl_arr, np.array(list(SCL_MASK_VALUES), dtype=np.int16))
     mmask = m0 | mcloud
 
-    # indices
     ndvi = (nir - red) / (nir + red + 1e-6)
     ndmi = (nir - swir) / (nir + swir + 1e-6)
     ndwi = (green - nir) / (green + nir + 1e-6)
@@ -397,7 +417,6 @@ def fast_zonal_multi_mean_count(parcels_gdf, parcels_id_col, raster_paths_dict, 
     idx_names = list(raster_paths_dict.keys())
     paths = [raster_paths_dict[k] for k in idx_names]
 
-    # On prend le 1er raster comme référence grille/blocks
     with rasterio.open(paths[0]) as ref:
         transform = ref.transform
         out_shape = (ref.height, ref.width)
@@ -418,11 +437,9 @@ def fast_zonal_multi_mean_count(parcels_gdf, parcels_id_col, raster_paths_dict, 
         dtype="int32",
     )
 
-    # accumulateurs par index
     sums = {k: np.zeros(len(parcels) + 1, dtype=np.float64) for k in idx_names}
     counts = {k: np.zeros(len(parcels) + 1, dtype=np.int64) for k in idx_names}
 
-    # ouvrir tous les rasters
     srcs = [rasterio.open(p) for p in paths]
     try:
         print("    Accumulate mean/count by blocks (multi-indices)...")
@@ -449,7 +466,6 @@ def fast_zonal_multi_mean_count(parcels_gdf, parcels_id_col, raster_paths_dict, 
         for s in srcs:
             s.close()
 
-    # construire df
     out = pd.DataFrame({parcels_id_col: ids})
     for idx_name in idx_names:
         mean = np.full(len(parcels) + 1, np.nan, dtype=np.float64)
@@ -475,7 +491,6 @@ for tile, its in selected.items():
         cloud = float(it.properties.get("eo:cloud_cover", 100.0))
         item_id = it.id
 
-        # footprint -> parcelles + bbox crop
         crop_bbox, parcels_tile = parcels_in_item_footprint(gdf_4326, it, pad_deg=PAD_DEG)
         if crop_bbox is None:
             continue
@@ -488,22 +503,26 @@ for tile, its in selected.items():
         # download + crop bandes
         band_paths = {}
         ok = True
+
         for b in BANDS:
             if b not in it.assets:
                 print(f"  ⚠️ Asset manquant {b} pour {item_id} -> skip")
                 ok = False
                 break
+
             out_path = os.path.join(out_dir, f"{b}.tif")
+
             if not os.path.exists(out_path):
                 try:
                     p = download_crop_band(it.assets[b].href, out_path, crop_bbox)
                 except Exception as e:
-                    print(f"  ⚠️ Échec écriture raster {b} ({tile} {d}): {e} -> skip scène")
+                    print(f"  ❌ Erreur téléchargement/lecture pour {item_id} | bande {b} : {e}")
                     ok = False
                     break
                 if p is None:
                     ok = False
                     break
+
             band_paths[b] = out_path
 
         if not ok:
@@ -521,12 +540,10 @@ for tile, its in selected.items():
             continue
         print("  Indices:", ", ".join(idx_paths.keys()))
 
-        # reproj parcelles au CRS (B08)
         with rasterio.open(band_paths["B08"]) as src:
             crs_ref = src.crs
         parcels_tile_r = parcels_tile.to_crs(crs_ref)
 
-        # zonal fast multi-indices
         df_stats = fast_zonal_multi_mean_count(
             parcels_tile_r,
             parcels_id_col=ID_COL,
@@ -535,14 +552,11 @@ for tile, its in selected.items():
             progress_every=100
         )
 
-        # filtrage qualité (au moins MIN_PX_COUNT sur NDVI, par exemple)
         if MIN_PX_COUNT > 0:
             ref_col = "ndvi_count" if "ndvi_count" in df_stats.columns else f"{INDEX_NAMES[0].lower()}_count"
             if ref_col in df_stats.columns:
                 df_stats = df_stats[df_stats[ref_col].fillna(0) >= MIN_PX_COUNT].copy()
 
-        # export format long (comme tu fais déjà)
-        # une ligne par (parcelle, date, indice)
         for _, r in df_stats.iterrows():
             pid = r[ID_COL]
             for idx_name in idx_paths.keys():

@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--indices-csv",
-        default="data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d.csv",
+        default="data/s2_herault_2024_full/indices_parcelles_2024-01-01_2024-12-31_win5d.csv",
         help="CSV long des indices par parcelle",
     )
     parser.add_argument("--labels-csv", default="export.csv", help="CSV RPG (verite terrain)")
