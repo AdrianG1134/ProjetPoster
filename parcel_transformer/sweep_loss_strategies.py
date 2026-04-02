@@ -23,7 +23,11 @@ def parse_args() -> argparse.Namespace:
         help="Root folder for sweep outputs.",
     )
     parser.add_argument("--split-method", type=str, choices=["parcel", "tile"], default="tile")
-    parser.add_argument("--index-filter", type=str, default="NDVI,NDMI,NDWI,EVI")
+    parser.add_argument(
+        "--index-filter",
+        type=str,
+        default="NDVI,NDMI,NDWI,GNDVI,SAVI,OSAVI,MSAVI,MNDWI,ARVI,BSI",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--focal-gamma", type=float, default=1.5)
     parser.add_argument(

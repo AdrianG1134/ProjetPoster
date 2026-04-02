@@ -2,11 +2,12 @@ $ErrorActionPreference = "Stop"
 
 $csv = "data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_and_group_min200.csv"
 $outRoot = "outputs_transformer/rare_aug_cv_experiments"
+$indexFilter = "NDVI,NDMI,NDWI,GNDVI,SAVI,OSAVI,MSAVI,MNDWI,ARVI,BSI"
 
 $baseArgs = @(
   "--csv-path", $csv,
   "--split-method", "tile",
-  "--index-filter", "NDVI,NDMI,NDWI,EVI",
+  "--index-filter", $indexFilter,
   "--loss-type", "focal",
   "--focal-gamma", "1.5",
   "--class-weighting",
@@ -37,7 +38,7 @@ python parcel_transformer/train.py @baseArgs `
 Write-Host "`n=== RUN spatial_cv (3 folds) ==="
 python parcel_transformer/spatial_cv_groupkfold.py `
   --csv-path $csv `
-  --index-filter "NDVI,NDMI,NDWI,EVI" `
+  --index-filter $indexFilter `
   --n-splits 3 `
   --val-size 0.1 `
   --seed 42 `

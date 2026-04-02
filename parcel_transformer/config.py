@@ -8,6 +8,19 @@ PoolingType = Literal["cls", "mean"]
 SchedulerType = Literal["none", "plateau", "cosine"]
 LossType = Literal["cross_entropy", "focal", "balanced_softmax", "logit_adjusted"]
 
+DEFAULT_INDEX_FILTER = [
+    "NDVI",
+    "NDMI",
+    "NDWI",
+    "GNDVI",
+    "SAVI",
+    "OSAVI",
+    "MSAVI",
+    "MNDWI",
+    "ARVI",
+    "BSI",
+]
+
 
 @dataclass
 class DataConfig:
@@ -25,7 +38,7 @@ class DataConfig:
     tile_col: str = "tile"
     cloud_col: str = "cloud_scene"
     px_count_col: str = "px_count"
-    index_filter: list[str] = field(default_factory=list)
+    index_filter: list[str] = field(default_factory=lambda: list(DEFAULT_INDEX_FILTER))
     min_px_count: int = 0
     max_cloud_scene: Optional[float] = None
     min_obs_per_parcel: int = 4
@@ -49,6 +62,7 @@ class ModelConfig:
     dropout: float = 0.1
     pooling: PoolingType = "cls"
     use_layer_norm_first: bool = True
+    reliability_aware: bool = False
 
 
 @dataclass
@@ -64,6 +78,9 @@ class TrainConfig:
     logit_adjust_tau: float = 1.0
     use_group_task: bool = False
     group_loss_weight: float = 0.3
+    hierarchical_constraint: bool = False
+    hierarchical_constraint_weight: float = 1.0
+    hierarchical_constraint_eps: float = 1e-6
     class_weighting: bool = True
     class_weight_power: float = 0.5
     weighted_sampler: bool = False

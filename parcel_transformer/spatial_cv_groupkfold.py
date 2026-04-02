@@ -75,6 +75,8 @@ def build_fold_dataset(
         features=prepared.features,
         day_of_year=prepared.day_of_year,
         observed_mask=prepared.observed_mask,
+        cloud_scene=prepared.cloud_scene,
+        px_count=prepared.px_count,
         labels=prepared.labels,
         group_labels=prepared.group_labels,
         parcel_ids=prepared.parcel_ids,

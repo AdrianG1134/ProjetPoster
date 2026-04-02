@@ -108,10 +108,26 @@ class TemporalTransformerClassifier(nn.Module):
         if cfg.pooling not in {"cls", "mean"}:
             raise ValueError(f"Unsupported pooling mode: {cfg.pooling}")
 
+        self.input_dim = input_dim
+        self.num_classes = num_classes
+        self.num_group_classes = num_group_classes
         self.pooling = cfg.pooling
+        self.reliability_aware = bool(getattr(cfg, "reliability_aware", False))
         self.feature_proj = nn.Linear(input_dim, cfg.d_model)
         self.doy_encoding = DayOfYearEncoding(cfg.d_model, cfg.dropout)
         self.input_dropout = nn.Dropout(cfg.dropout)
+        if self.reliability_aware:
+            self.reliability_proj = nn.Sequential(
+                nn.Linear(3, cfg.d_model),
+                nn.GELU(),
+                nn.Linear(cfg.d_model, cfg.d_model),
+            )
+            self.reliability_dropout = nn.Dropout(cfg.dropout)
+            self.reliability_gate_logit = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        else:
+            self.reliability_proj = None
+            self.reliability_dropout = None
+            self.register_parameter("reliability_gate_logit", None)
         self.layers = nn.ModuleList(
             [
                 TemporalEncoderLayer(
@@ -143,23 +159,81 @@ class TemporalTransformerClassifier(nn.Module):
             if num_group_classes > 0
             else None
         )
+        if num_group_classes > 0:
+            compat_default = torch.ones((num_group_classes, num_classes), dtype=torch.float32)
+        else:
+            compat_default = torch.empty((0, 0), dtype=torch.float32)
 
-    def forward(
+        # Non-persistent buffers: moved with .to(device), but not saved in checkpoints.
+        # This keeps backward compatibility with older checkpoints.
+        self.register_buffer("class_group_compat", compat_default, persistent=False)
+        self.register_buffer("hierarchical_constraint_enabled", torch.tensor(False), persistent=False)
+        self.register_buffer("hierarchical_constraint_weight", torch.tensor(0.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("hierarchical_constraint_eps", torch.tensor(1.0e-6, dtype=torch.float32), persistent=False)
+
+    def _prepare_quality_inputs(
+        self,
+        observed_mask: Tensor,
+        quality_features: Optional[Tensor],
+        dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor]:
+        observed = observed_mask.float()
+        if quality_features is None:
+            cloud = 1.0 - observed
+            px = observed
+            quality = torch.stack([observed, cloud, px], dim=-1)
+        else:
+            quality = quality_features.to(device=observed_mask.device, dtype=dtype)
+            if quality.ndim != 3:
+                raise ValueError("quality_features must have shape [B, T, Q].")
+            if quality.shape[0] != observed_mask.shape[0] or quality.shape[1] != observed_mask.shape[1]:
+                raise ValueError(
+                    "quality_features must match features/observed_mask shape on the first two dimensions."
+                )
+            if quality.shape[-1] < 3:
+                pad = torch.zeros(
+                    quality.shape[0],
+                    quality.shape[1],
+                    3 - quality.shape[-1],
+                    device=quality.device,
+                    dtype=quality.dtype,
+                )
+                quality = torch.cat([quality, pad], dim=-1)
+            elif quality.shape[-1] > 3:
+                quality = quality[..., :3]
+
+        quality = quality.clone()
+        quality[..., 1] = torch.where(observed_mask, quality[..., 1].clamp(0.0, 1.0), torch.ones_like(quality[..., 1]))
+        quality[..., 2] = torch.where(observed_mask, quality[..., 2].clamp(0.0, 1.0), torch.zeros_like(quality[..., 2]))
+        reliability = torch.where(observed_mask, quality[..., 0].clamp(0.0, 1.0), torch.zeros_like(quality[..., 0]))
+        quality[..., 0] = reliability
+        return quality, reliability
+
+    def encode(
         self,
         features: Tensor,
         day_of_year: Tensor,
         observed_mask: Tensor,
+        quality_features: Optional[Tensor] = None,
         return_attention: bool = False,
     ) -> dict[str, Tensor | list[Tensor]]:
-        """
-        Args:
-            features: [B, T, F]
-            day_of_year: [B, T]
-            observed_mask: [B, T] with True where date exists.
-        """
         key_padding_mask = ~observed_mask.bool()  # True means "ignore token"
 
         x = self.feature_proj(features) + self.doy_encoding(day_of_year)
+        temporal_reliability = observed_mask.float()
+        if self.reliability_aware:
+            quality_inputs, temporal_reliability = self._prepare_quality_inputs(
+                observed_mask=observed_mask.bool(),
+                quality_features=quality_features,
+                dtype=features.dtype,
+            )
+            reliability_embed = self.reliability_proj(quality_inputs)
+            if self.reliability_dropout is not None:
+                reliability_embed = self.reliability_dropout(reliability_embed)
+            gate_strength = torch.sigmoid(self.reliability_gate_logit)
+            x = x + reliability_embed
+            token_gate = (1.0 - gate_strength) + (gate_strength * temporal_reliability.unsqueeze(-1))
+            x = x * token_gate
         x = self.input_dropout(x)
 
         if self.pooling == "cls":
@@ -178,17 +252,108 @@ class TemporalTransformerClassifier(nn.Module):
             if return_attention and attn_weights is not None:
                 attentions.append(attn_weights)
 
+        temporal_tokens = x[:, 1:] if self.pooling == "cls" else x
+        return {
+            "encoded_tokens": x,
+            "temporal_tokens": temporal_tokens,
+            "key_padding_mask": key_padding_mask,
+            "temporal_reliability": temporal_reliability,
+            "attention_maps": attentions,
+        }
+
+    def configure_hierarchical_constraint(
+        self,
+        class_group_compat: Tensor,
+        weight: float,
+        eps: float = 1.0e-6,
+        enabled: bool = True,
+    ) -> None:
+        if self.num_group_classes <= 0:
+            raise ValueError("Cannot enable hierarchical constraint without group head.")
+        if class_group_compat.ndim != 2:
+            raise ValueError("class_group_compat must be a 2D tensor [G, C].")
+        if class_group_compat.shape[0] != self.num_group_classes:
+            raise ValueError(
+                f"class_group_compat has invalid group dimension: {class_group_compat.shape[0]} "
+                f"(expected {self.num_group_classes})."
+            )
+        if class_group_compat.shape[1] != self.num_classes:
+            raise ValueError(
+                f"class_group_compat has invalid class dimension: {class_group_compat.shape[1]} "
+                f"(expected {self.num_classes})."
+            )
+        if eps <= 0:
+            raise ValueError("eps must be > 0.")
+
+        compat = class_group_compat.to(device=self.class_group_compat.device, dtype=torch.float32)
+        compat = compat.clamp(min=0.0)
+        col_sum = compat.sum(dim=0, keepdim=True)
+        zero_cols = col_sum <= 0.0
+        if torch.any(zero_cols):
+            compat[:, zero_cols.squeeze(0)] = 1.0 / float(self.num_group_classes)
+            col_sum = compat.sum(dim=0, keepdim=True)
+        compat = compat / col_sum.clamp(min=1.0e-12)
+
+        self.class_group_compat.copy_(compat)
+        self.hierarchical_constraint_weight.fill_(float(weight))
+        self.hierarchical_constraint_eps.fill_(float(eps))
+        self.hierarchical_constraint_enabled.fill_(bool(enabled))
+
+    def forward(
+        self,
+        features: Tensor,
+        day_of_year: Tensor,
+        observed_mask: Tensor,
+        quality_features: Optional[Tensor] = None,
+        return_attention: bool = False,
+    ) -> dict[str, Tensor | list[Tensor]]:
+        """
+        Args:
+            features: [B, T, F]
+            day_of_year: [B, T]
+            observed_mask: [B, T] with True where date exists.
+        """
+        encoded = self.encode(
+            features=features,
+            day_of_year=day_of_year,
+            observed_mask=observed_mask,
+            quality_features=quality_features,
+            return_attention=return_attention,
+        )
+        x = encoded["encoded_tokens"]
+        key_padding_mask = encoded["key_padding_mask"]
+        temporal_reliability = encoded["temporal_reliability"]
+        attentions = encoded["attention_maps"]
+
         if self.pooling == "cls":
             pooled = x[:, 0]
         else:
             valid_tokens = (~key_padding_mask).unsqueeze(-1).float()
-            denominator = valid_tokens.sum(dim=1).clamp(min=1.0)
-            pooled = (x * valid_tokens).sum(dim=1) / denominator
+            if self.reliability_aware:
+                rel_weights = temporal_reliability.unsqueeze(-1).clamp(min=0.05)
+                token_weights = valid_tokens * rel_weights
+            else:
+                token_weights = valid_tokens
+            denominator = token_weights.sum(dim=1).clamp(min=1.0)
+            pooled = (x * token_weights).sum(dim=1) / denominator
 
         logits = self.classifier(pooled)
         outputs: dict[str, Tensor | list[Tensor]] = {"logits": logits}
         if self.group_classifier is not None:
-            outputs["group_logits"] = self.group_classifier(pooled)
+            group_logits = self.group_classifier(pooled)
+            outputs["group_logits"] = group_logits
+
+            if bool(self.hierarchical_constraint_enabled.item()):
+                group_probs = torch.softmax(group_logits, dim=1)
+                class_compat = torch.matmul(group_probs, self.class_group_compat)
+                constrained_logits = logits + float(self.hierarchical_constraint_weight.item()) * torch.log(
+                    class_compat.clamp(min=float(self.hierarchical_constraint_eps.item()))
+                )
+                outputs["logits_raw"] = logits
+                outputs["logits"] = constrained_logits
+                outputs["hierarchical_class_compat"] = class_compat
+        if self.reliability_aware:
+            outputs["temporal_reliability"] = temporal_reliability
         if return_attention:
             outputs["attention_maps"] = attentions
         return outputs

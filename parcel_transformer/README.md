@@ -7,6 +7,7 @@ Classification multiclasses de cultures par parcelle a partir de series temporel
 - `data.py`: chargement CSV long, pivot en tenseur `[N, T, F]`, masque temporel, split `parcel` ou `tile`.
 - `model.py`: Transformer Encoder temporel avec encodage jour de l'annee.
 - `train.py`: entrainement PyTorch complet (AdamW, early stopping, meilleur checkpoint).
+- `pretrain_ssl.py`: pre-entrainement auto-supervise (masked reconstruction) pour initialiser l'encodeur.
 - `evaluate.py`: metriques, matrice de confusion, rapport de classification, attention temporelle moyenne.
 - `evaluate_ensemble.py`: evaluation par moyenne des logits de plusieurs checkpoints.
 - `prepare_dataset.py`: conversion CSV long -> dataset `.npz` pret pour PyTorch.
@@ -21,6 +22,8 @@ pip install -r parcel_transformer/requirements.txt
 ```bash
 python parcel_transformer/train.py --csv-path data/mon_csv_long.csv --output-dir outputs_transformer
 ```
+Par defaut, le pipeline utilise ce filtre d'indices: `NDVI,NDMI,NDWI,GNDVI,SAVI,OSAVI,MSAVI,MNDWI,ARVI,BSI`.
+Tu peux le surcharger avec `--index-filter ...`.
 
 ## Construire le CSV long d'entrainement depuis tes fichiers actuels
 ```bash
@@ -81,6 +84,14 @@ python parcel_transformer/train.py --csv-path data/mon_csv_long.csv --split-meth
 ```
 Le CSV doit contenir une colonne `label_group` (generee via `build_training_csv.py --group-col ...`).
 
+## Decodage contraint hierarchique (groupe -> classes compatibles)
+Active une contrainte au niveau des logits classes a partir des probabilites de groupe.
+Le `group head` est active automatiquement si besoin.
+```bash
+python parcel_transformer/train.py --csv-path data/mon_csv_long.csv --split-method tile --loss-type focal --focal-gamma 1.5 --class-weighting --class-weight-power 0.5 --standardize-features --hierarchical-constraint --hierarchical-constraint-weight 1.0 --hierarchical-constraint-eps 1e-6 --group-loss-weight 0.3
+```
+Artefacts sauvegardes: `hierarchical_constraint.json` + metadata dans `best_model.pt` (reevaluation/ensemble/distillation les reappliquent automatiquement).
+
 ## Preparation dataset NPZ (bonus)
 ```bash
 python parcel_transformer/prepare_dataset.py --csv-path data/mon_csv_long.csv --output-npz data/parcel_dataset.npz
@@ -91,6 +102,22 @@ python parcel_transformer/prepare_dataset.py --csv-path data/mon_csv_long.csv --
 python parcel_transformer/train.py --prepared-npz data/parcel_dataset.npz --output-dir outputs_transformer
 ```
 
+## Reliability-aware Transformer
+Ajoute un signal de qualite temporelle (fiabilite, cloud_scene, px_count) dans l'encodeur et le pooling.
+```bash
+python parcel_transformer/train.py --prepared-npz data/parcel_dataset.npz --reliability-aware --output-dir outputs_transformer
+```
+
+## Pre-entrainement auto-supervise (SSL) puis fine-tuning supervise
+1) Pre-entrainement SSL (reconstruction de pas de temps masques):
+```bash
+python parcel_transformer/pretrain_ssl.py --prepared-npz data/parcel_dataset.npz --reliability-aware --epochs 30 --batch-size 64 --lr 7e-4 --mask-ratio 0.25 --output-dir outputs_transformer/ssl_pretrain_ext
+```
+2) Fine-tuning supervise initialise avec l'encodeur SSL:
+```bash
+python parcel_transformer/train.py --prepared-npz data/parcel_dataset.npz --reliability-aware --pretrained-encoder-checkpoint outputs_transformer/ssl_pretrain_ext/ssl_pretrain_YYYYMMDD_HHMMSS/best_ssl_encoder.pt --split-method tile --loss-type focal --focal-gamma 1.5 --class-weighting --class-weight-power 0.5 --standardize-features --phase2-rare-finetune --phase2-epochs 12 --phase2-lr 1e-4 --phase2-sampler-power 1.0 --phase2-rare-quantile 0.25 --phase2-rare-boost 2.0 --output-dir outputs_transformer/ssl_finetune
+```
+
 ## Reevaluation d'un checkpoint
 ```bash
 python parcel_transformer/evaluate.py --checkpoint outputs_transformer/temporal_transformer_YYYYMMDD_HHMMSS/best_model.pt --prepared-npz data/parcel_dataset.npz
@@ -98,22 +125,23 @@ python parcel_transformer/evaluate.py --checkpoint outputs_transformer/temporal_
 
 ## Evaluation d'un ensemble de checkpoints
 ```bash
-python parcel_transformer/evaluate_ensemble.py --checkpoint-glob "outputs_transformer/seeds_std_focal_s*/temporal_transformer_*/best_model.pt" --csv-path data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_min200.csv --split-method tile --index-filter NDVI,NDMI,NDWI,EVI --output-dir outputs_transformer/ensemble_eval
+python parcel_transformer/evaluate_ensemble.py --checkpoint-glob "outputs_transformer/seeds_std_focal_s*/temporal_transformer_*/best_model.pt" --csv-path data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_min200.csv --split-method tile --index-filter NDVI,NDMI,NDWI,GNDVI,SAVI,OSAVI,MSAVI,MNDWI,ARVI,BSI --output-dir outputs_transformer/ensemble_eval
 ```
+Ponderation possible des checkpoints par score validation (macro-F1): ajouter `--ensemble-weighting val_macro_f1 --weight-power 1.0`.
 
 ## Distillation d'un ensemble vers un seul modele
 ```bash
-python parcel_transformer/distill_ensemble.py --teacher-checkpoint-glob "outputs_transformer/phase2_seeds_ensemble/s*/temporal_transformer_*/best_model.pt" --csv-path data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_and_group_min200.csv --split-method tile --index-filter NDVI,NDMI,NDWI,EVI --standardize-features --class-weighting --class-weight-power 0.5 --epochs 60 --batch-size 64 --lr 7e-4 --hard-label-weight 0.4 --temperature 2.0 --output-dir outputs_transformer/distill_phase2_ensemble
+python parcel_transformer/distill_ensemble.py --teacher-checkpoint-glob "outputs_transformer/phase2_seeds_ensemble/s*/temporal_transformer_*/best_model.pt" --csv-path data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_and_group_min200.csv --split-method tile --index-filter NDVI,NDMI,NDWI,GNDVI,SAVI,OSAVI,MSAVI,MNDWI,ARVI,BSI --standardize-features --class-weighting --class-weight-power 0.5 --epochs 60 --batch-size 64 --lr 7e-4 --hard-label-weight 0.4 --temperature 2.0 --output-dir outputs_transformer/distill_phase2_ensemble
 ```
 
 ## Mini sweep automatique des losses
 ```bash
-python parcel_transformer/sweep_loss_strategies.py --csv-path data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_and_group_min200.csv --split-method tile --index-filter NDVI,NDMI,NDWI,EVI --seed 42
+python parcel_transformer/sweep_loss_strategies.py --csv-path data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_and_group_min200.csv --split-method tile --index-filter NDVI,NDMI,NDWI,GNDVI,SAVI,OSAVI,MSAVI,MNDWI,ARVI,BSI --seed 42
 ```
 
 ## CV spatiale robuste (GroupKFold par tile)
 ```bash
-python parcel_transformer/spatial_cv_groupkfold.py --csv-path data/mon_csv_long.csv --index-filter NDVI,NDMI,NDWI,EVI --n-splits 5 --val-size 0.1 --seed 42 --train-extra-args "--loss-type focal --focal-gamma 1.5 --class-weighting --class-weight-power 0.5 --standardize-features --no-use-group-task"
+python parcel_transformer/spatial_cv_groupkfold.py --csv-path data/mon_csv_long.csv --index-filter NDVI,NDMI,NDWI,GNDVI,SAVI,OSAVI,MSAVI,MNDWI,ARVI,BSI --n-splits 5 --val-size 0.1 --seed 42 --train-extra-args "--loss-type focal --focal-gamma 1.5 --class-weighting --class-weight-power 0.5 --standardize-features --no-use-group-task"
 ```
 
 ## Lancement automatise (augmentation + phase 2 + CV spatiale)
@@ -125,3 +153,25 @@ powershell -ExecutionPolicy Bypass -File parcel_transformer/run_rare_aug_cv_expe
 ```powershell
 powershell -ExecutionPolicy Bypass -File parcel_transformer/run_phase2_seeds_ensemble.ps1
 ```
+
+## Lancement automatise SSL + reliability-aware + seeds + ensemble
+Pipeline recommande pour les experiences actuelles:
+1) pre-entrainement SSL termine (fichier `best_ssl_encoder.pt` disponible),
+2) fine-tuning supervise multi-seeds,
+3) evaluation ensemble uniforme + pondere.
+```powershell
+powershell -ExecutionPolicy Bypass -File parcel_transformer/run_ssl_finetune_seeds_ensemble.ps1 -PreparedNpz "data/parcel_dataset_ext.npz"
+```
+Relance partielle (sans re-entrainement des seeds):
+```powershell
+powershell -ExecutionPolicy Bypass -File parcel_transformer/run_ssl_finetune_seeds_ensemble.ps1 -PreparedNpz "data/parcel_dataset_ext.npz" -SkipTrain
+```
+Le script detecte automatiquement le dernier encodeur SSL sous `outputs_transformer/ssl_pretrain_ext`.
+Tu peux aussi fournir explicitement `-EncoderPath ...`.
+
+## Option vitesse (NPZ prepare)
+Evite la preparation CSV->tenseurs a chaque run:
+```powershell
+python parcel_transformer/train.py --prepared-npz data/parcel_dataset_ext.npz --split-method tile --reliability-aware --output-dir outputs_transformer
+```
+Tu peux aussi skipper uniquement l'ensemble avec `-SkipEnsemble`.

@@ -3,11 +3,12 @@ $ErrorActionPreference = "Stop"
 $csv = "data/s2_herault_2024_full_year_5day_cloudmask_fast/indices_parcelles_2024-01-01_2024-12-31_win5d_with_labels_and_group_min200.csv"
 $outRoot = "outputs_transformer/phase2_seeds_ensemble"
 $seeds = @(42, 123, 777)
+$indexFilter = "NDVI,NDMI,NDWI,GNDVI,SAVI,OSAVI,MSAVI,MNDWI,ARVI,BSI"
 
 $commonArgs = @(
   "--csv-path", $csv,
   "--split-method", "tile",
-  "--index-filter", "NDVI,NDMI,NDWI,EVI",
+  "--index-filter", $indexFilter,
   "--loss-type", "focal",
   "--focal-gamma", "1.5",
   "--class-weighting",
@@ -49,7 +50,9 @@ python parcel_transformer/evaluate_ensemble.py `
   --checkpoint-glob $ckptGlob `
   --csv-path $csv `
   --split-method tile `
-  --index-filter NDVI,NDMI,NDWI,EVI `
+  --index-filter $indexFilter `
+  --ensemble-weighting val_macro_f1 `
+  --weight-power 1.0 `
   --output-dir "$outRoot/ensemble_eval"
 
 $ensembleMetricsPath = Join-Path $outRoot "ensemble_eval/test_ensemble_metrics.json"

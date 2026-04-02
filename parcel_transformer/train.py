@@ -61,6 +61,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ff-dim", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--pooling", type=str, choices=["cls", "mean"], default=None)
+    parser.add_argument(
+        "--reliability-aware",
+        dest="reliability_aware",
+        action="store_true",
+        default=None,
+        help="Inject reliability signals (observed mask / cloud / px_count) into temporal encoding and pooling.",
+    )
+    parser.add_argument(
+        "--no-reliability-aware",
+        dest="reliability_aware",
+        action="store_false",
+        default=None,
+    )
+    parser.add_argument(
+        "--pretrained-encoder-checkpoint",
+        type=str,
+        default=None,
+        help="Optional SSL checkpoint (.pt) used to initialize backbone encoder weights before supervised training.",
+    )
 
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -110,6 +129,31 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Weight for auxiliary group loss when --use-group-task is enabled.",
+    )
+    parser.add_argument(
+        "--hierarchical-constraint",
+        dest="hierarchical_constraint",
+        action="store_true",
+        default=None,
+        help="Enable hierarchical constrained decoding (group probabilities constrain class logits).",
+    )
+    parser.add_argument(
+        "--no-hierarchical-constraint",
+        dest="hierarchical_constraint",
+        action="store_false",
+        default=None,
+    )
+    parser.add_argument(
+        "--hierarchical-constraint-weight",
+        type=float,
+        default=None,
+        help="Lambda weight for hierarchical log-compatibility added to class logits.",
+    )
+    parser.add_argument(
+        "--hierarchical-constraint-eps",
+        type=float,
+        default=None,
+        help="Numerical epsilon for hierarchical log-compatibility term.",
     )
     parser.add_argument("--scheduler", type=str, choices=["none", "plateau", "cosine"], default=None)
     parser.add_argument("--class-weighting", action="store_true")
@@ -218,6 +262,8 @@ def apply_args_to_config(args: argparse.Namespace, cfg: ExperimentConfig) -> Exp
         cfg.model.dropout = args.dropout
     if args.pooling is not None:
         cfg.model.pooling = args.pooling
+    if args.reliability_aware is not None:
+        cfg.model.reliability_aware = args.reliability_aware
 
     if args.epochs is not None:
         cfg.train.epochs = args.epochs
@@ -239,6 +285,12 @@ def apply_args_to_config(args: argparse.Namespace, cfg: ExperimentConfig) -> Exp
         cfg.train.use_group_task = args.use_group_task
     if args.group_loss_weight is not None:
         cfg.train.group_loss_weight = args.group_loss_weight
+    if args.hierarchical_constraint is not None:
+        cfg.train.hierarchical_constraint = args.hierarchical_constraint
+    if args.hierarchical_constraint_weight is not None:
+        cfg.train.hierarchical_constraint_weight = args.hierarchical_constraint_weight
+    if args.hierarchical_constraint_eps is not None:
+        cfg.train.hierarchical_constraint_eps = args.hierarchical_constraint_eps
     if args.scheduler is not None:
         cfg.train.scheduler = args.scheduler
     if args.class_weight_power is not None:
@@ -282,6 +334,76 @@ def apply_args_to_config(args: argparse.Namespace, cfg: ExperimentConfig) -> Exp
         cfg.train.class_weighting = False
 
     return cfg
+
+
+def _load_pretrained_encoder_weights(
+    model: nn.Module,
+    checkpoint_path: str,
+    device: torch.device,
+    logger,
+) -> None:
+    path = Path(checkpoint_path)
+    if not path.exists():
+        raise FileNotFoundError(f"pretrained encoder checkpoint not found: {path}")
+
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=device)
+
+    if isinstance(checkpoint, dict):
+        if "encoder_state_dict" in checkpoint and isinstance(checkpoint["encoder_state_dict"], dict):
+            source_state = checkpoint["encoder_state_dict"]
+        elif "model_state_dict" in checkpoint and isinstance(checkpoint["model_state_dict"], dict):
+            source_state = checkpoint["model_state_dict"]
+        else:
+            source_state = {
+                k: v
+                for k, v in checkpoint.items()
+                if isinstance(v, torch.Tensor)
+            }
+    else:
+        raise ValueError("Unsupported checkpoint format for pretrained encoder.")
+
+    allowed_prefixes = (
+        "feature_proj.",
+        "doy_encoding.",
+        "layers.",
+        "cls_token",
+        "reliability_proj.",
+        "reliability_gate_logit",
+    )
+    normalized_state: dict[str, torch.Tensor] = {}
+    for raw_key, value in source_state.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        key = str(raw_key)
+        if key.startswith("module."):
+            key = key[len("module.") :]
+        if key.startswith("backbone."):
+            key = key[len("backbone.") :]
+        normalized_state[key] = value
+
+    filtered_state = {
+        k: v
+        for k, v in normalized_state.items()
+        if any(k == prefix or k.startswith(prefix) for prefix in allowed_prefixes)
+    }
+    if len(filtered_state) == 0:
+        raise ValueError(
+            "No compatible encoder parameters found in pretrained checkpoint. "
+            "Expected keys starting with: feature_proj, doy_encoding, layers, cls_token, reliability_* "
+            "(optionally prefixed by backbone. and/or module.)."
+        )
+
+    missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+    logger.info(
+        "Loaded pretrained encoder weights from %s | loaded=%d | missing=%d | unexpected=%d",
+        path,
+        len(filtered_state),
+        len(missing),
+        len(unexpected),
+    )
 
 
 def build_scheduler(
@@ -540,6 +662,42 @@ def build_rare_finetune_sampler(
     return sampler, stats
 
 
+def build_class_group_compatibility(
+    labels: np.ndarray,
+    group_labels: np.ndarray,
+    train_indices: np.ndarray,
+    num_classes: int,
+    num_group_classes: int,
+) -> tuple[np.ndarray, dict[str, float]]:
+    if num_group_classes <= 0:
+        raise ValueError("num_group_classes must be > 0.")
+
+    train_labels = labels[train_indices]
+    train_groups = group_labels[train_indices]
+    valid_mask = train_groups >= 0
+    valid_labels = train_labels[valid_mask]
+    valid_groups = train_groups[valid_mask]
+
+    counts = np.zeros((num_group_classes, num_classes), dtype=np.float64)
+    np.add.at(counts, (valid_groups, valid_labels), 1.0)
+
+    col_sum = counts.sum(axis=0, keepdims=True)
+    missing_classes_mask = (col_sum <= 0).reshape(-1)
+    if np.any(missing_classes_mask):
+        counts[:, missing_classes_mask] = 1.0 / float(num_group_classes)
+        col_sum = counts.sum(axis=0, keepdims=True)
+
+    compat = counts / np.clip(col_sum, a_min=1.0e-12, a_max=None)
+    links_per_class = (compat > 0).sum(axis=0)
+    stats = {
+        "valid_samples": float(valid_mask.sum()),
+        "missing_classes": float(missing_classes_mask.sum()),
+        "mean_links_per_class": float(links_per_class.mean()),
+        "max_links_per_class": float(links_per_class.max()),
+    }
+    return compat.astype(np.float32), stats
+
+
 def run_epoch(
     model: nn.Module,
     dataloader: torch.utils.data.DataLoader,
@@ -564,6 +722,7 @@ def run_epoch(
         features = batch["features"].to(device=device, dtype=torch.float32)
         day_of_year = batch["day_of_year"].to(device=device, dtype=torch.float32)
         observed_mask = batch["observed_mask"].to(device=device, dtype=torch.bool)
+        quality_features = batch["quality_features"].to(device=device, dtype=torch.float32)
         labels = batch["label"].to(device=device, dtype=torch.long)
         group_labels = batch["group_label"].to(device=device, dtype=torch.long)
 
@@ -575,6 +734,7 @@ def run_epoch(
                 features=features,
                 day_of_year=day_of_year,
                 observed_mask=observed_mask,
+                quality_features=quality_features,
                 return_attention=False,
             )
             logits = outputs["logits"]
@@ -676,6 +836,10 @@ def main() -> None:
         raise ValueError("phase2_rare_boost must be > 0.")
     if cfg.train.phase2_early_stopping_patience <= 0:
         raise ValueError("phase2_early_stopping_patience must be > 0.")
+    if cfg.train.hierarchical_constraint_weight < 0:
+        raise ValueError("hierarchical_constraint_weight must be >= 0.")
+    if cfg.train.hierarchical_constraint_eps <= 0:
+        raise ValueError("hierarchical_constraint_eps must be > 0.")
 
     set_seed(cfg.train.seed)
     run_dir = create_run_dir(cfg.data.output_dir, prefix="temporal_transformer")
@@ -708,7 +872,11 @@ def main() -> None:
     if split_sizes.get("test", 0) == 0:
         raise ValueError("Test split is empty.")
 
-    use_group_task = cfg.train.use_group_task
+    use_group_task = cfg.train.use_group_task or cfg.train.hierarchical_constraint
+    if cfg.train.hierarchical_constraint and not cfg.train.use_group_task:
+        logger.info(
+            "Hierarchical constrained decoding enabled: group head is activated automatically."
+        )
     if use_group_task and not prepared.has_group_labels:
         raise ValueError(
             "Group task enabled but no group labels are available. "
@@ -799,6 +967,14 @@ def main() -> None:
         cfg=cfg.model,
         num_group_classes=prepared.num_group_classes if use_group_task else 0,
     ).to(device)
+    logger.info("Reliability-aware transformer: %s", "enabled" if cfg.model.reliability_aware else "disabled")
+    if args.pretrained_encoder_checkpoint:
+        _load_pretrained_encoder_weights(
+            model=model,
+            checkpoint_path=args.pretrained_encoder_checkpoint,
+            device=device,
+            logger=logger,
+        )
 
     train_labels = prepared.labels[prepared.splits["train"]]
     class_counts_np = np.bincount(train_labels, minlength=prepared.num_classes).astype(np.float64)
@@ -834,6 +1010,7 @@ def main() -> None:
     group_criterion: Optional[nn.Module] = None
     group_counts_t: Optional[torch.Tensor] = None
     group_priors_t: Optional[torch.Tensor] = None
+    class_group_compat_np: Optional[np.ndarray] = None
     if use_group_task:
         assert prepared.group_labels is not None
         train_group_labels = prepared.group_labels[prepared.splits["train"]]
@@ -866,6 +1043,39 @@ def main() -> None:
             prepared.num_group_classes,
             cfg.train.group_loss_weight,
         )
+
+        if cfg.train.hierarchical_constraint:
+            class_group_compat_np, compat_stats = build_class_group_compatibility(
+                labels=prepared.labels,
+                group_labels=prepared.group_labels,
+                train_indices=prepared.splits["train"],
+                num_classes=prepared.num_classes,
+                num_group_classes=prepared.num_group_classes,
+            )
+            model.configure_hierarchical_constraint(
+                class_group_compat=torch.tensor(class_group_compat_np, dtype=torch.float32, device=device),
+                weight=cfg.train.hierarchical_constraint_weight,
+                eps=cfg.train.hierarchical_constraint_eps,
+                enabled=True,
+            )
+            save_json(
+                {
+                    "group_label_names": prepared.group_label_names,
+                    "label_names": prepared.label_names,
+                    "class_group_compat": class_group_compat_np.tolist(),
+                    "weight": cfg.train.hierarchical_constraint_weight,
+                    "eps": cfg.train.hierarchical_constraint_eps,
+                    "stats": compat_stats,
+                },
+                run_dir / "hierarchical_constraint.json",
+            )
+            logger.info(
+                "Hierarchical constrained decoding enabled | weight=%.3f | eps=%.1e | missing_classes=%.0f | mean_links=%.2f",
+                cfg.train.hierarchical_constraint_weight,
+                cfg.train.hierarchical_constraint_eps,
+                compat_stats["missing_classes"],
+                compat_stats["mean_links_per_class"],
+            )
 
     criterion = build_loss_criterion(
         loss_type=cfg.train.loss_type,
@@ -1000,12 +1210,17 @@ def main() -> None:
                     "group_label_names": prepared.group_label_names if use_group_task else [],
                     "feature_names": prepared.feature_names,
                     "pooling": cfg.model.pooling,
+                    "reliability_aware": bool(cfg.model.reliability_aware),
                     "loss_type": cfg.train.loss_type,
                     "focal_gamma": cfg.train.focal_gamma,
                     "logit_adjust_tau": cfg.train.logit_adjust_tau,
                     "class_weight_power": cfg.train.class_weight_power,
                     "num_group_classes": prepared.num_group_classes if use_group_task else 0,
                     "use_group_task": bool(use_group_task),
+                    "hierarchical_constraint": bool(cfg.train.hierarchical_constraint),
+                    "hierarchical_constraint_weight": cfg.train.hierarchical_constraint_weight,
+                    "hierarchical_constraint_eps": cfg.train.hierarchical_constraint_eps,
+                    "class_group_compat": class_group_compat_np.tolist() if class_group_compat_np is not None else None,
                 },
             )
             logger.info("Saved new best model (val_f1=%.4f).", best_val_f1)
@@ -1171,6 +1386,7 @@ def main() -> None:
                         "group_label_names": prepared.group_label_names if use_group_task else [],
                         "feature_names": prepared.feature_names,
                         "pooling": cfg.model.pooling,
+                        "reliability_aware": bool(cfg.model.reliability_aware),
                         "loss_type": cfg.train.loss_type,
                         "focal_gamma": cfg.train.focal_gamma,
                         "logit_adjust_tau": cfg.train.logit_adjust_tau,
@@ -1180,6 +1396,10 @@ def main() -> None:
                         "stage": "phase2_rare_finetune",
                         "phase2_learning_rate": cfg.train.phase2_learning_rate,
                         "rare_class_ids": rare_class_ids.tolist(),
+                        "hierarchical_constraint": bool(cfg.train.hierarchical_constraint),
+                        "hierarchical_constraint_weight": cfg.train.hierarchical_constraint_weight,
+                        "hierarchical_constraint_eps": cfg.train.hierarchical_constraint_eps,
+                        "class_group_compat": class_group_compat_np.tolist() if class_group_compat_np is not None else None,
                     },
                 )
                 logger.info("Saved new phase 2 best model (val_f1=%.4f).", phase2_best_val_f1)

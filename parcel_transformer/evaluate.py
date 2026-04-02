@@ -26,6 +26,52 @@ from model import TemporalTransformerClassifier
 from utils import resolve_device, save_json, setup_logger
 
 
+def configure_hierarchical_constraint_from_metadata(
+    model: TemporalTransformerClassifier,
+    metadata: dict[str, Any],
+    logger,
+) -> None:
+    enabled = bool(metadata.get("hierarchical_constraint", False))
+    compat = metadata.get("class_group_compat")
+    if not enabled or compat is None:
+        return
+
+    try:
+        compat_tensor = torch.tensor(compat, dtype=torch.float32, device=next(model.parameters()).device)
+        model.configure_hierarchical_constraint(
+            class_group_compat=compat_tensor,
+            weight=float(metadata.get("hierarchical_constraint_weight", 1.0)),
+            eps=float(metadata.get("hierarchical_constraint_eps", 1.0e-6)),
+            enabled=True,
+        )
+        logger.info(
+            "Enabled hierarchical constrained decoding from checkpoint metadata (weight=%.3f).",
+            float(metadata.get("hierarchical_constraint_weight", 1.0)),
+        )
+    except Exception as exc:
+        logger.warning("Could not apply hierarchical constraint from metadata: %s", exc)
+
+
+def checkpoint_uses_reliability(checkpoint: dict[str, Any]) -> bool:
+    metadata = checkpoint.get("metadata", {})
+    if isinstance(metadata, dict) and "reliability_aware" in metadata:
+        return bool(metadata.get("reliability_aware", False))
+
+    state_dict = checkpoint.get("model_state_dict", {})
+    if not isinstance(state_dict, dict):
+        return False
+
+    for raw_key in state_dict.keys():
+        key = str(raw_key)
+        if key.startswith("module."):
+            key = key[len("module.") :]
+        if key.startswith("backbone."):
+            key = key[len("backbone.") :]
+        if key.startswith("reliability_proj.") or key == "reliability_gate_logit":
+            return True
+    return False
+
+
 @torch.no_grad()
 def predict_model(
     model: torch.nn.Module,
@@ -46,12 +92,14 @@ def predict_model(
         features = batch["features"].to(device=device, dtype=torch.float32)
         day_of_year = batch["day_of_year"].to(device=device, dtype=torch.float32)
         observed_mask = batch["observed_mask"].to(device=device, dtype=torch.bool)
+        quality_features = batch["quality_features"].to(device=device, dtype=torch.float32)
         labels = batch["label"].to(device=device, dtype=torch.long)
 
         outputs = model(
             features=features,
             day_of_year=day_of_year,
             observed_mask=observed_mask,
+            quality_features=quality_features,
             return_attention=return_attention,
         )
         logits = outputs["logits"]
@@ -359,6 +407,7 @@ def main() -> None:
     except TypeError:
         checkpoint = torch.load(args.checkpoint, map_location=device)
     metadata = checkpoint.get("metadata", {})
+    cfg.model.reliability_aware = checkpoint_uses_reliability(checkpoint)
     num_group_classes = int(metadata.get("num_group_classes", 0) or 0)
     model = TemporalTransformerClassifier(
         input_dim=prepared.num_features,
@@ -367,6 +416,7 @@ def main() -> None:
         num_group_classes=num_group_classes,
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
+    configure_hierarchical_constraint_from_metadata(model=model, metadata=metadata, logger=logger)
     logger.info("Loaded checkpoint: %s", args.checkpoint)
 
     metrics = evaluate_split(
