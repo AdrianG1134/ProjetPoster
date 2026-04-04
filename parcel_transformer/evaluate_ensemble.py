@@ -435,6 +435,8 @@ def main() -> None:
 
     metrics_payload = {
         "accuracy": metrics["accuracy"],
+        "recall_macro": metrics["recall_macro"],
+        "recall_weighted": metrics["recall_weighted"],
         "f1_macro": metrics["f1_macro"],
         "f1_weighted": metrics["f1_weighted"],
         "classification_report": metrics["classification_report_dict"],
@@ -478,10 +480,11 @@ def main() -> None:
     pred_df.to_csv(output_dir / f"{args.split}_ensemble_predictions.csv", index=False)
 
     logger.info(
-        "ENSEMBLE %s | n_models=%d | accuracy=%.4f macro_f1=%.4f weighted_f1=%.4f",
+        "ENSEMBLE %s | n_models=%d | accuracy=%.4f recall_macro=%.4f macro_f1=%.4f weighted_f1=%.4f",
         args.split.upper(),
         len(models),
         metrics["accuracy"],
+        metrics["recall_macro"],
         metrics["f1_macro"],
         metrics["f1_weighted"],
     )

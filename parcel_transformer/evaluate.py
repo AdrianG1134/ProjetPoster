@@ -17,6 +17,7 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     f1_score,
+    recall_score,
 )
 from torch.utils.data import DataLoader
 
@@ -171,6 +172,8 @@ def compute_classification_metrics(
 ) -> dict[str, Any]:
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
+        "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+        "recall_weighted": float(recall_score(y_true, y_pred, average="weighted", zero_division=0)),
         "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
         "f1_weighted": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
     }
@@ -296,10 +299,13 @@ def evaluate_split(
 def _serialize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     return {
         "accuracy": metrics["accuracy"],
+        "recall_macro": metrics["recall_macro"],
+        "recall_weighted": metrics["recall_weighted"],
         "f1_macro": metrics["f1_macro"],
         "f1_weighted": metrics["f1_weighted"],
         "classification_report": metrics["classification_report_dict"],
         "error_analysis": metrics["error_analysis"],
+        "confusion_matrix": metrics["confusion_matrix"].tolist(),
     }
 
 
@@ -456,9 +462,10 @@ def main() -> None:
         att_df.to_csv(output_dir / f"{args.split}_temporal_attention.csv", index=False)
 
     logger.info(
-        "%s | accuracy=%.4f macro_f1=%.4f weighted_f1=%.4f",
+        "%s | accuracy=%.4f recall_macro=%.4f macro_f1=%.4f weighted_f1=%.4f",
         args.split.upper(),
         metrics["accuracy"],
+        metrics["recall_macro"],
         metrics["f1_macro"],
         metrics["f1_weighted"],
     )

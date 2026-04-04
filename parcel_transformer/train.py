@@ -4,10 +4,13 @@ import argparse
 from pathlib import Path
 from typing import Optional
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, recall_score
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import WeightedRandomSampler
@@ -763,11 +766,23 @@ def run_epoch(
     epoch_loss = total_loss / max(total_samples, 1)
     epoch_group_loss = total_group_loss / max(total_samples, 1)
     epoch_acc = float(accuracy_score(y_true, y_pred)) if total_samples > 0 else float("nan")
+    epoch_recall_macro = (
+        float(recall_score(y_true, y_pred, average="macro", zero_division=0))
+        if total_samples > 0
+        else float("nan")
+    )
+    epoch_f1_weighted = (
+        float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+        if total_samples > 0
+        else float("nan")
+    )
     epoch_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0)) if total_samples > 0 else float("nan")
     return {
         "loss": epoch_loss,
         "group_loss": epoch_group_loss,
         "accuracy": epoch_acc,
+        "recall_macro": epoch_recall_macro,
+        "f1_weighted": epoch_f1_weighted,
         "f1_macro": epoch_f1,
     }
 
@@ -781,10 +796,13 @@ def save_eval_artifacts(
 ) -> None:
     serializable_metrics = {
         "accuracy": metrics["accuracy"],
+        "recall_macro": metrics["recall_macro"],
+        "recall_weighted": metrics["recall_weighted"],
         "f1_macro": metrics["f1_macro"],
         "f1_weighted": metrics["f1_weighted"],
         "classification_report": metrics["classification_report_dict"],
         "error_analysis": metrics["error_analysis"],
+        "confusion_matrix": metrics["confusion_matrix"].tolist(),
     }
     save_json(serializable_metrics, run_dir / f"{split_name}_metrics.json")
 
@@ -814,6 +832,98 @@ def save_eval_artifacts(
             }
         )
         attention_df.to_csv(run_dir / f"{split_name}_temporal_attention.csv", index=False)
+
+
+def save_split_comparison_artifacts(split_metrics: dict[str, dict], run_dir: Path) -> None:
+    if not split_metrics:
+        return
+
+    split_order = [split for split in ("train", "val", "test") if split in split_metrics]
+
+    rows: list[dict[str, float | str]] = []
+    for split in split_order:
+        metrics = split_metrics[split]
+        rows.append(
+            {
+                "split": split,
+                "accuracy": float(metrics.get("accuracy", float("nan"))),
+                "recall_macro": float(metrics.get("recall_macro", float("nan"))),
+                "f1_weighted": float(metrics.get("f1_weighted", float("nan"))),
+                "f1_macro": float(metrics.get("f1_macro", float("nan"))),
+            }
+        )
+
+    summary_df = pd.DataFrame(rows)
+    summary_df.to_csv(run_dir / "split_metrics_summary.csv", index=False)
+
+def save_epoch_metric_curves(
+    history: list[dict[str, float]],
+    phase2_history: list[dict[str, float]],
+    run_dir: Path,
+) -> None:
+    if not history and not phase2_history:
+        return
+
+    all_rows: list[dict[str, float]] = []
+    for row in history:
+        all_rows.append(dict(row))
+
+    phase1_len = len(history)
+    for row in phase2_history:
+        merged = dict(row)
+        merged["epoch"] = float(phase1_len + int(row.get("epoch", 0)))
+        all_rows.append(merged)
+
+    history_df = pd.DataFrame(all_rows).sort_values("epoch").reset_index(drop=True)
+    history_df.to_csv(run_dir / "history_all_phases.csv", index=False)
+
+    metric_specs = [
+        ("accuracy", "Accuracy", "train_acc", "val_acc"),
+        ("recall_macro", "Recall (macro)", "train_recall_macro", "val_recall_macro"),
+        ("f1_weighted", "F1 (weighted)", "train_f1_weighted", "val_f1_weighted"),
+        ("f1_macro", "F1 (macro)", "train_f1_macro", "val_f1_macro"),
+    ]
+
+    for metric_key, metric_title, train_col, val_col in metric_specs:
+        if train_col not in history_df.columns or val_col not in history_df.columns:
+            continue
+
+        plt.figure(figsize=(8, 4.5))
+        plt.plot(
+            history_df["epoch"],
+            history_df[train_col],
+            marker="o",
+            linewidth=1.8,
+            markersize=4,
+            label="train",
+        )
+        plt.plot(
+            history_df["epoch"],
+            history_df[val_col],
+            marker="o",
+            linewidth=1.8,
+            markersize=4,
+            label="val",
+        )
+
+        if phase2_history:
+            plt.axvline(
+                x=phase1_len + 0.5,
+                color="gray",
+                linestyle="--",
+                linewidth=1.0,
+                label="phase2 start",
+            )
+
+        plt.ylim(0.0, 1.0)
+        plt.xlabel("Epoch")
+        plt.ylabel(metric_title)
+        plt.title(f"{metric_title}: train vs val")
+        plt.grid(alpha=0.25)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(run_dir / f"metric_compare_{metric_key}.png", dpi=200)
+        plt.close()
 
 
 def main() -> None:
@@ -1122,6 +1232,7 @@ def main() -> None:
     best_val_f1 = float("-inf")
     best_model_path = run_dir / "best_model.pt"
     history: list[dict[str, float]] = []
+    phase2_history: list[dict[str, float]] = []
 
     for epoch in range(1, cfg.train.epochs + 1):
         train_metrics = run_epoch(
@@ -1152,6 +1263,8 @@ def main() -> None:
                 "loss": float("nan"),
                 "group_loss": float("nan"),
                 "accuracy": float("nan"),
+                "recall_macro": float("nan"),
+                "f1_weighted": float("nan"),
                 "f1_macro": float("nan"),
             }
             val_f1 = train_metrics["f1_macro"]
@@ -1187,10 +1300,14 @@ def main() -> None:
                 "train_loss": train_metrics["loss"],
                 "train_group_loss": train_metrics["group_loss"],
                 "train_acc": train_metrics["accuracy"],
+                "train_recall_macro": train_metrics["recall_macro"],
+                "train_f1_weighted": train_metrics["f1_weighted"],
                 "train_f1_macro": train_metrics["f1_macro"],
                 "val_loss": val_metrics["loss"],
                 "val_group_loss": val_metrics["group_loss"],
                 "val_acc": val_metrics["accuracy"],
+                "val_recall_macro": val_metrics["recall_macro"],
+                "val_f1_weighted": val_metrics["f1_weighted"],
                 "val_f1_macro": val_metrics["f1_macro"],
             }
         )
@@ -1297,8 +1414,6 @@ def main() -> None:
 
         phase2_best_model_path = run_dir / "best_model_phase2.pt"
         phase2_best_val_f1 = best_val_f1
-        phase2_history: list[dict[str, float]] = []
-
         for epoch in range(1, cfg.train.phase2_epochs + 1):
             train_metrics = run_epoch(
                 model=model,
@@ -1328,6 +1443,8 @@ def main() -> None:
                     "loss": float("nan"),
                     "group_loss": float("nan"),
                     "accuracy": float("nan"),
+                    "recall_macro": float("nan"),
+                    "f1_weighted": float("nan"),
                     "f1_macro": float("nan"),
                 }
                 val_f1 = train_metrics["f1_macro"]
@@ -1364,10 +1481,14 @@ def main() -> None:
                     "train_loss": train_metrics["loss"],
                     "train_group_loss": train_metrics["group_loss"],
                     "train_acc": train_metrics["accuracy"],
+                    "train_recall_macro": train_metrics["recall_macro"],
+                    "train_f1_weighted": train_metrics["f1_weighted"],
                     "train_f1_macro": train_metrics["f1_macro"],
                     "val_loss": val_metrics["loss"],
                     "val_group_loss": val_metrics["group_loss"],
                     "val_acc": val_metrics["accuracy"],
+                    "val_recall_macro": val_metrics["recall_macro"],
+                    "val_f1_weighted": val_metrics["f1_weighted"],
                     "val_f1_macro": val_metrics["f1_macro"],
                 }
             )
@@ -1425,6 +1546,8 @@ def main() -> None:
                 best_val_f1,
             )
 
+    save_epoch_metric_curves(history=history, phase2_history=phase2_history, run_dir=run_dir)
+
     logger.info("Training finished. Loading best checkpoint from %s", best_model_path)
     try:
         checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
@@ -1432,39 +1555,72 @@ def main() -> None:
         checkpoint = torch.load(best_model_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
+    eval_dataloaders = build_dataloaders(
+        prepared=prepared,
+        batch_size=cfg.train.batch_size,
+        num_workers=cfg.train.num_workers,
+        pin_memory=(device.type == "cuda"),
+        train_sampler=None,
+        train_augmentation=None,
+    )
+    split_evals: dict[str, dict] = {}
+
+    train_eval = evaluate_split(
+        model=model,
+        dataloader=eval_dataloaders["train"],
+        device=device,
+        label_names=prepared.label_names,
+        pooling=cfg.model.pooling,
+        return_attention=False,
+    )
+    save_eval_artifacts("train", train_eval, prepared.label_names, run_dir, prepared.time_grid)
+    split_evals["train"] = train_eval
+    logger.info(
+        "TRAIN | acc=%.4f recall_macro=%.4f macro_f1=%.4f weighted_f1=%.4f",
+        train_eval["accuracy"],
+        train_eval["recall_macro"],
+        train_eval["f1_macro"],
+        train_eval["f1_weighted"],
+    )
+
     if split_sizes.get("val", 0) > 0:
         val_eval = evaluate_split(
             model=model,
-            dataloader=dataloaders["val"],
+            dataloader=eval_dataloaders["val"],
             device=device,
             label_names=prepared.label_names,
             pooling=cfg.model.pooling,
             return_attention=True,
         )
         save_eval_artifacts("val", val_eval, prepared.label_names, run_dir, prepared.time_grid)
+        split_evals["val"] = val_eval
         logger.info(
-            "VAL | acc=%.4f macro_f1=%.4f weighted_f1=%.4f",
+            "VAL | acc=%.4f recall_macro=%.4f macro_f1=%.4f weighted_f1=%.4f",
             val_eval["accuracy"],
+            val_eval["recall_macro"],
             val_eval["f1_macro"],
             val_eval["f1_weighted"],
         )
 
     test_eval = evaluate_split(
         model=model,
-        dataloader=dataloaders["test"],
+        dataloader=eval_dataloaders["test"],
         device=device,
         label_names=prepared.label_names,
         pooling=cfg.model.pooling,
         return_attention=True,
     )
     save_eval_artifacts("test", test_eval, prepared.label_names, run_dir, prepared.time_grid)
+    split_evals["test"] = test_eval
     logger.info(
-        "TEST | acc=%.4f macro_f1=%.4f weighted_f1=%.4f",
+        "TEST | acc=%.4f recall_macro=%.4f macro_f1=%.4f weighted_f1=%.4f",
         test_eval["accuracy"],
+        test_eval["recall_macro"],
         test_eval["f1_macro"],
         test_eval["f1_weighted"],
     )
 
+    save_split_comparison_artifacts(split_evals, run_dir)
     logger.info("Artifacts saved in %s", run_dir)
 
 
