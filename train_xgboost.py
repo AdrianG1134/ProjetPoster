@@ -3,10 +3,19 @@ import argparse
 import json
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 
@@ -78,6 +87,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Verbosite de RandomizedSearchCV",
+    )
+    parser.add_argument(
+        "--tune-n-jobs",
+        type=int,
+        default=1,
+        help="Nombre de jobs paralleles pour RandomizedSearchCV (1 recommande sous Windows)",
+    )
+    parser.add_argument(
+        "--train-n-jobs",
+        type=int,
+        default=-1,
+        help="Nombre de threads XGBoost pour l'entrainement final (-1 = tous les coeurs)",
     )
     parser.add_argument(
         "--early-stopping-rounds",
@@ -460,13 +481,22 @@ def main() -> None:
             param_distributions=param_dist,
             n_iter=args.tune_n_iter,
             scoring="f1_macro",
-            n_jobs=-1,
+            n_jobs=args.tune_n_jobs,
             cv=cv,
             random_state=args.random_state,
             verbose=args.tune_verbose,
             refit=True,
+            pre_dispatch=max(1, args.tune_n_jobs) if args.tune_n_jobs != -1 else "2*n_jobs",
         )
-        search.fit(X_train, y_train, sample_weight=sample_weight)
+        try:
+            search.fit(X_train, y_train, sample_weight=sample_weight)
+        except OSError as exc:
+            if "WinError 1450" in str(exc) and args.tune_n_jobs != 1:
+                print("WinError 1450 detecte pendant le tuning, retry automatique avec --tune-n-jobs=1")
+                search.set_params(n_jobs=1, pre_dispatch=1)
+                search.fit(X_train, y_train, sample_weight=sample_weight)
+            else:
+                raise
         best_params = search.best_params_
         cv_macro_mean = float(search.best_score_)
         cv_macro_std = float(search.cv_results_["std_test_score"][search.best_index_])
@@ -478,7 +508,7 @@ def main() -> None:
     model = make_xgb_model(
         n_classes=n_classes,
         random_state=args.random_state,
-        n_jobs=-1,
+        n_jobs=args.train_n_jobs,
         max_depth=args.max_depth,
         min_child_weight=args.min_child_weight,
         gamma=args.gamma,
@@ -535,6 +565,9 @@ def main() -> None:
     y_pred = model.predict(X_test)
 
     acc = accuracy_score(y_test, y_pred)
+    macro_accuracy = balanced_accuracy_score(y_test, y_pred)
+    macro_precision = precision_score(y_test, y_pred, average="macro", zero_division=0)
+    macro_recall = recall_score(y_test, y_pred, average="macro", zero_division=0)
     macro_f1 = f1_score(y_test, y_pred, average="macro")
     weighted_f1 = f1_score(y_test, y_pred, average="weighted")
 
@@ -544,6 +577,8 @@ def main() -> None:
 
     cm = confusion_matrix(y_test, y_pred)
     cm_df = pd.DataFrame(cm, index=class_names, columns=class_names)
+    cm_row_sum = cm_df.sum(axis=1).replace(0, np.nan)
+    df_norm = cm_df.div(cm_row_sum, axis=0).fillna(0.0)
 
     feature_names = X.columns.tolist()
     feat_imp, date_imp, index_imp = aggregate_feature_importance(model, feature_names)
@@ -567,6 +602,9 @@ def main() -> None:
         "missing_before_imputation": missing_before,
         "missing_after_imputation": missing_after,
         "accuracy": float(acc),
+        "macro_accuracy": float(macro_accuracy),
+        "macro_precision": float(macro_precision),
+        "macro_recall": float(macro_recall),
         "macro_f1": float(macro_f1),
         "weighted_f1": float(weighted_f1),
     }
@@ -574,9 +612,27 @@ def main() -> None:
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     report_df.to_csv(out_dir / "classification_report.csv", index=True)
     cm_df.to_csv(out_dir / "confusion_matrix.csv", index=True)
+    df_norm.to_csv(out_dir / "confusion_matrix_normalized.csv", index=True)
     feat_imp.to_csv(out_dir / "feature_importance_gain.csv", index=False)
     date_imp.to_csv(out_dir / "date_importance_gain.csv", index=False)
     index_imp.to_csv(out_dir / "index_importance_gain.csv", index=False)
+
+    plt.figure(figsize=(8, 6))
+    plt.imshow(df_norm, cmap="Greens")
+    plt.colorbar()
+    plt.xticks(range(len(class_names)), class_names, rotation=90)
+    plt.yticks(range(len(class_names)), class_names)
+    plt.xlabel("Classe prédite")
+    plt.ylabel("Classe réelle")
+    plt.title("Matrice de confusion (normalisée)")
+    ax = plt.gca()
+    ax.set_frame_on(False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(length=0)
+    plt.tight_layout()
+    plt.savefig(out_dir / "confusion_matrix_normalized.png", dpi=200)
+    plt.close()
 
     print("\n=== Resultats XGBoost ===")
     print(f"Samples: {metrics['n_samples']:,} | Features: {metrics['n_features']:,} | Classes: {metrics['n_classes']}")
@@ -587,6 +643,9 @@ def main() -> None:
     print(f"Missing (avant): {metrics['missing_before_imputation']:.4f}")
     print(f"Missing (apres): {metrics['missing_after_imputation']:.4f}")
     print(f"Accuracy: {metrics['accuracy']:.4f}")
+    print(f"Macro-Accuracy: {metrics['macro_accuracy']:.4f}")
+    print(f"Macro-Precision: {metrics['macro_precision']:.4f}")
+    print(f"Macro-Recall: {metrics['macro_recall']:.4f}")
     print(f"Macro-F1: {metrics['macro_f1']:.4f}")
     print(f"Weighted-F1: {metrics['weighted_f1']:.4f}")
     print(f"\nFichiers ecrits dans: {out_dir.resolve()}")

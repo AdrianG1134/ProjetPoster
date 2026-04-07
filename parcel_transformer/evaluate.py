@@ -10,13 +10,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import torch
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
     confusion_matrix,
     f1_score,
+    precision_score,
     recall_score,
 )
 from torch.utils.data import DataLoader
@@ -172,6 +172,7 @@ def compute_classification_metrics(
 ) -> dict[str, Any]:
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
         "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
         "recall_weighted": float(recall_score(y_true, y_pred, average="weighted", zero_division=0)),
         "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
@@ -243,21 +244,23 @@ def plot_confusion_matrix(
     cm = confusion.astype(np.float64)
     if normalize:
         row_sum = cm.sum(axis=1, keepdims=True)
-        cm = cm / np.clip(row_sum, a_min=1e-12, a_max=None)
+        df_norm = cm / np.clip(row_sum, a_min=1e-12, a_max=None)
+    else:
+        df_norm = cm
 
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(
-        cm,
-        cmap="Blues",
-        xticklabels=label_names,
-        yticklabels=label_names,
-        annot=False,
-        cbar=True,
-        square=True,
-    )
-    plt.title("Confusion Matrix" + (" (normalized)" if normalize else ""))
-    plt.xlabel("Predicted label")
-    plt.ylabel("True label")
+    plt.figure(figsize=(8, 6))
+    plt.imshow(df_norm, cmap="Greens")
+    plt.colorbar()
+    plt.xticks(np.arange(len(label_names)), label_names, rotation=90)
+    plt.yticks(np.arange(len(label_names)), label_names)
+    plt.title("Matrice de confusion" + (" (normalisée)" if normalize else ""))
+    plt.xlabel("Classe prédite")
+    plt.ylabel("Classe réelle")
+    ax = plt.gca()
+    ax.set_frame_on(False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(length=0)
     plt.tight_layout()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -274,7 +277,7 @@ def evaluate_split(
     return_attention: bool = False,
 ) -> dict[str, Any]:
     if len(dataloader.dataset) == 0:
-        raise ValueError("Cannot evaluate an empty dataset split.")
+        raise ValueError("Impossible d'évaluer un split vide.")
 
     predictions = predict_model(
         model=model,
@@ -298,10 +301,19 @@ def evaluate_split(
 
 def _serialize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     return {
+        "exactitude": metrics["accuracy"],
+        "precision_macro": metrics["precision_macro"],
+        "rappel_macro": metrics["recall_macro"],
+        "rappel_pondere": metrics["recall_weighted"],
+        "f1_macro": metrics["f1_macro"],
+        "f1_pondere": metrics["f1_weighted"],
+        "rapport_classification": metrics["classification_report_dict"],
+        "analyse_erreurs": metrics["error_analysis"],
+        "matrice_confusion": metrics["confusion_matrix"].tolist(),
+        # Compatibilite descendante
         "accuracy": metrics["accuracy"],
         "recall_macro": metrics["recall_macro"],
         "recall_weighted": metrics["recall_weighted"],
-        "f1_macro": metrics["f1_macro"],
         "f1_weighted": metrics["f1_weighted"],
         "classification_report": metrics["classification_report_dict"],
         "error_analysis": metrics["error_analysis"],
@@ -310,16 +322,16 @@ def _serialize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate Temporal Transformer checkpoint.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to .pt checkpoint.")
-    parser.add_argument("--output-dir", type=str, default="eval_outputs", help="Output directory for artifacts.")
+    parser = argparse.ArgumentParser(description="Evaluation d'un checkpoint Temporal Transformer.")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Chemin du checkpoint .pt.")
+    parser.add_argument("--output-dir", type=str, default="eval_outputs", help="Dossier de sortie des artefacts.")
     parser.add_argument("--split", type=str, choices=["train", "val", "test"], default="test")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--batch-size", type=int, default=128)
 
-    parser.add_argument("--config-json", type=str, default=None, help="Optional config.json from training run.")
-    parser.add_argument("--csv-path", type=str, default=None, help="CSV input path (if not using NPZ).")
-    parser.add_argument("--prepared-npz", type=str, default=None, help="Prepared NPZ input path.")
+    parser.add_argument("--config-json", type=str, default=None, help="Fichier config.json optionnel du run.")
+    parser.add_argument("--csv-path", type=str, default=None, help="Chemin du CSV d'entree (si pas de NPZ).")
+    parser.add_argument("--prepared-npz", type=str, default=None, help="Chemin du NPZ prepare.")
     parser.add_argument("--min-obs", type=int, default=None)
     parser.add_argument("--split-method", type=str, choices=["parcel", "tile"], default=None)
     parser.add_argument("--time-grid-frequency", type=str, default=None)
@@ -382,13 +394,13 @@ def main() -> None:
         cfg.model.pooling = args.pooling
 
     if args.csv_path is None and args.prepared_npz is None and cfg.data.prepared_npz_path is None:
-        raise ValueError("Provide --csv-path or --prepared-npz (or set prepared_npz_path in config).")
+        raise ValueError("Fournis --csv-path ou --prepared-npz (ou prepared_npz_path dans la config).")
 
     prepared = prepare_dataset(cfg.data)
     if args.split not in prepared.splits:
-        raise ValueError(f"Split '{args.split}' not found in prepared dataset.")
+        raise ValueError(f"Le split '{args.split}' est introuvable dans le dataset prepare.")
     if prepared.splits[args.split].shape[0] == 0:
-        raise ValueError(f"Split '{args.split}' is empty.")
+        raise ValueError(f"Le split '{args.split}' est vide.")
     if cfg.train.standardize_features:
         standardize_prepared_features(
             prepared=prepared,
@@ -396,7 +408,7 @@ def main() -> None:
             eps=cfg.train.standardize_eps,
         )
         logger.info(
-            "Applied train-only feature standardization (eps=%.1e) before evaluation.",
+            "Standardisation des features basee sur le train uniquement (eps=%.1e) avant evaluation.",
             cfg.train.standardize_eps,
         )
 
@@ -423,7 +435,7 @@ def main() -> None:
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     configure_hierarchical_constraint_from_metadata(model=model, metadata=metadata, logger=logger)
-    logger.info("Loaded checkpoint: %s", args.checkpoint)
+    logger.info("Checkpoint charge: %s", args.checkpoint)
 
     metrics = evaluate_split(
         model=model,
@@ -434,9 +446,28 @@ def main() -> None:
         return_attention=True,
     )
 
+    split_name_fr = {"train": "entrainement", "val": "validation", "test": "test"}.get(args.split, args.split)
+
+    save_json(_serialize_metrics(metrics), output_dir / f"{split_name_fr}_metriques.json")
     save_json(_serialize_metrics(metrics), output_dir / f"{args.split}_metrics.json")
+
+    with (output_dir / f"{split_name_fr}_rapport_classification.txt").open("w", encoding="utf-8") as f:
+        f.write(metrics["classification_report_text"])
     with (output_dir / f"{args.split}_classification_report.txt").open("w", encoding="utf-8") as f:
         f.write(metrics["classification_report_text"])
+    plot_confusion_matrix(
+        confusion=metrics["confusion_matrix"],
+        label_names=prepared.label_names,
+        output_path=output_dir / f"{split_name_fr}_matrice_confusion.png",
+        normalize=False,
+    )
+    plot_confusion_matrix(
+        confusion=metrics["confusion_matrix"],
+        label_names=prepared.label_names,
+        output_path=output_dir / f"{split_name_fr}_matrice_confusion_normalisee.png",
+        normalize=True,
+    )
+    # Compatibilite descendante
     plot_confusion_matrix(
         confusion=metrics["confusion_matrix"],
         label_names=prepared.label_names,
@@ -459,12 +490,14 @@ def main() -> None:
                 "mean_attention": predictions["temporal_attention"],
             }
         )
+        att_df.to_csv(output_dir / f"{split_name_fr}_attention_temporelle.csv", index=False)
         att_df.to_csv(output_dir / f"{args.split}_temporal_attention.csv", index=False)
 
     logger.info(
-        "%s | accuracy=%.4f recall_macro=%.4f macro_f1=%.4f weighted_f1=%.4f",
-        args.split.upper(),
+        "%s | exactitude=%.4f precision_macro=%.4f rappel_macro=%.4f f1_macro=%.4f f1_pondere=%.4f",
+        split_name_fr.upper(),
         metrics["accuracy"],
+        metrics["precision_macro"],
         metrics["recall_macro"],
         metrics["f1_macro"],
         metrics["f1_weighted"],

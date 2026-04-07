@@ -795,20 +795,45 @@ def save_eval_artifacts(
     time_grid: np.ndarray,
 ) -> None:
     serializable_metrics = {
+        "exactitude": metrics["accuracy"],
+        "precision_macro": metrics["precision_macro"],
+        "rappel_macro": metrics["recall_macro"],
+        "rappel_pondere": metrics["recall_weighted"],
+        "f1_macro": metrics["f1_macro"],
+        "f1_pondere": metrics["f1_weighted"],
+        "rapport_classification": metrics["classification_report_dict"],
+        "analyse_erreurs": metrics["error_analysis"],
+        "matrice_confusion": metrics["confusion_matrix"].tolist(),
+        # Compatibilite descendante
         "accuracy": metrics["accuracy"],
         "recall_macro": metrics["recall_macro"],
         "recall_weighted": metrics["recall_weighted"],
-        "f1_macro": metrics["f1_macro"],
         "f1_weighted": metrics["f1_weighted"],
         "classification_report": metrics["classification_report_dict"],
         "error_analysis": metrics["error_analysis"],
         "confusion_matrix": metrics["confusion_matrix"].tolist(),
     }
+    save_json(serializable_metrics, run_dir / f"{split_name}_metriques.json")
     save_json(serializable_metrics, run_dir / f"{split_name}_metrics.json")
 
+    with (run_dir / f"{split_name}_rapport_classification.txt").open("w", encoding="utf-8") as f:
+        f.write(metrics["classification_report_text"])
     with (run_dir / f"{split_name}_classification_report.txt").open("w", encoding="utf-8") as f:
         f.write(metrics["classification_report_text"])
 
+    plot_confusion_matrix(
+        confusion=metrics["confusion_matrix"],
+        label_names=label_names,
+        output_path=run_dir / f"{split_name}_matrice_confusion.png",
+        normalize=False,
+    )
+    plot_confusion_matrix(
+        confusion=metrics["confusion_matrix"],
+        label_names=label_names,
+        output_path=run_dir / f"{split_name}_matrice_confusion_normalisee.png",
+        normalize=True,
+    )
+    # Compatibilite descendante
     plot_confusion_matrix(
         confusion=metrics["confusion_matrix"],
         label_names=label_names,
@@ -831,6 +856,7 @@ def save_eval_artifacts(
                 "mean_attention": predictions["temporal_attention"],
             }
         )
+        attention_df.to_csv(run_dir / f"{split_name}_attention_temporelle.csv", index=False)
         attention_df.to_csv(run_dir / f"{split_name}_temporal_attention.csv", index=False)
 
 
@@ -838,22 +864,30 @@ def save_split_comparison_artifacts(split_metrics: dict[str, dict], run_dir: Pat
     if not split_metrics:
         return
 
-    split_order = [split for split in ("train", "val", "test") if split in split_metrics]
+    split_order = list(split_metrics.keys())
+    split_labels = {
+        "train": "entrainement",
+        "val": "validation",
+        "validation": "validation",
+        "test": "test",
+    }
 
     rows: list[dict[str, float | str]] = []
     for split in split_order:
         metrics = split_metrics[split]
         rows.append(
             {
-                "split": split,
-                "accuracy": float(metrics.get("accuracy", float("nan"))),
-                "recall_macro": float(metrics.get("recall_macro", float("nan"))),
-                "f1_weighted": float(metrics.get("f1_weighted", float("nan"))),
+                "jeu": split_labels.get(split, split),
+                "exactitude": float(metrics.get("accuracy", float("nan"))),
+                "precision_macro": float(metrics.get("precision_macro", float("nan"))),
+                "rappel_macro": float(metrics.get("recall_macro", float("nan"))),
+                "f1_pondere": float(metrics.get("f1_weighted", float("nan"))),
                 "f1_macro": float(metrics.get("f1_macro", float("nan"))),
             }
         )
 
     summary_df = pd.DataFrame(rows)
+    summary_df.to_csv(run_dir / "resume_metriques_splits.csv", index=False)
     summary_df.to_csv(run_dir / "split_metrics_summary.csv", index=False)
 
 def save_epoch_metric_curves(
@@ -976,11 +1010,11 @@ def main() -> None:
     logger.info("Split sizes: %s", split_sizes)
 
     if split_sizes.get("train", 0) == 0:
-        raise ValueError("Train split is empty.")
+        raise ValueError("Le split d'entrainement est vide.")
     if split_sizes.get("val", 0) == 0:
-        logger.warning("Validation split is empty. Early stopping disabled.")
+        logger.warning("Le split de validation est vide. L'early stopping sera desactive.")
     if split_sizes.get("test", 0) == 0:
-        raise ValueError("Test split is empty.")
+        raise ValueError("Le split de test est vide.")
 
     use_group_task = cfg.train.use_group_task or cfg.train.hierarchical_constraint
     if cfg.train.hierarchical_constraint and not cfg.train.use_group_task:
@@ -1565,43 +1599,6 @@ def main() -> None:
     )
     split_evals: dict[str, dict] = {}
 
-    train_eval = evaluate_split(
-        model=model,
-        dataloader=eval_dataloaders["train"],
-        device=device,
-        label_names=prepared.label_names,
-        pooling=cfg.model.pooling,
-        return_attention=False,
-    )
-    save_eval_artifacts("train", train_eval, prepared.label_names, run_dir, prepared.time_grid)
-    split_evals["train"] = train_eval
-    logger.info(
-        "TRAIN | acc=%.4f recall_macro=%.4f macro_f1=%.4f weighted_f1=%.4f",
-        train_eval["accuracy"],
-        train_eval["recall_macro"],
-        train_eval["f1_macro"],
-        train_eval["f1_weighted"],
-    )
-
-    if split_sizes.get("val", 0) > 0:
-        val_eval = evaluate_split(
-            model=model,
-            dataloader=eval_dataloaders["val"],
-            device=device,
-            label_names=prepared.label_names,
-            pooling=cfg.model.pooling,
-            return_attention=True,
-        )
-        save_eval_artifacts("val", val_eval, prepared.label_names, run_dir, prepared.time_grid)
-        split_evals["val"] = val_eval
-        logger.info(
-            "VAL | acc=%.4f recall_macro=%.4f macro_f1=%.4f weighted_f1=%.4f",
-            val_eval["accuracy"],
-            val_eval["recall_macro"],
-            val_eval["f1_macro"],
-            val_eval["f1_weighted"],
-        )
-
     test_eval = evaluate_split(
         model=model,
         dataloader=eval_dataloaders["test"],
@@ -1613,15 +1610,16 @@ def main() -> None:
     save_eval_artifacts("test", test_eval, prepared.label_names, run_dir, prepared.time_grid)
     split_evals["test"] = test_eval
     logger.info(
-        "TEST | acc=%.4f recall_macro=%.4f macro_f1=%.4f weighted_f1=%.4f",
+        "TEST | exactitude=%.4f precision_macro=%.4f rappel_macro=%.4f f1_macro=%.4f f1_pondere=%.4f",
         test_eval["accuracy"],
+        test_eval["precision_macro"],
         test_eval["recall_macro"],
         test_eval["f1_macro"],
         test_eval["f1_weighted"],
     )
 
     save_split_comparison_artifacts(split_evals, run_dir)
-    logger.info("Artifacts saved in %s", run_dir)
+    logger.info("Artefacts de test sauvegardes dans %s", run_dir)
 
 
 if __name__ == "__main__":
