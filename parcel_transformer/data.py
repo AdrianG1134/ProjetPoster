@@ -26,6 +26,8 @@ class PreparedDataset:
     features: np.ndarray
     day_of_year: np.ndarray
     observed_mask: np.ndarray
+    cloud_scene: Optional[np.ndarray]
+    px_count: Optional[np.ndarray]
     labels: np.ndarray
     parcel_ids: np.ndarray
     parcel_tiles: np.ndarray
@@ -73,6 +75,18 @@ class ParcelTimeSeriesDataset(Dataset):
         self.features = prepared.features[indices]
         self.day_of_year = prepared.day_of_year[indices]
         self.observed_mask = prepared.observed_mask[indices]
+        default_cloud = np.full(self.day_of_year.shape, 100.0, dtype=np.float32)
+        default_px = np.zeros(self.day_of_year.shape, dtype=np.float32)
+        self.cloud_scene = (
+            prepared.cloud_scene[indices].astype(np.float32)
+            if prepared.cloud_scene is not None
+            else default_cloud
+        )
+        self.px_count = (
+            prepared.px_count[indices].astype(np.float32)
+            if prepared.px_count is not None
+            else default_px
+        )
         self.labels = prepared.labels[indices]
         self.group_labels = (
             prepared.group_labels[indices]
@@ -88,10 +102,14 @@ class ParcelTimeSeriesDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
         features = self.features[idx]
         observed_mask = self.observed_mask[idx]
+        cloud_scene = self.cloud_scene[idx]
+        px_count = self.px_count[idx]
 
         if self.augmentation is not None:
             features = features.copy()
             observed_mask = observed_mask.copy()
+            cloud_scene = cloud_scene.copy()
+            px_count = px_count.copy()
 
             observed_idx = np.flatnonzero(observed_mask)
             if self.augmentation.time_mask_ratio > 0 and observed_idx.size > 0:
@@ -109,10 +127,24 @@ class ParcelTimeSeriesDataset(Dataset):
                 ).astype(np.float32)
                 features[observed_mask] = features[observed_mask] + noise[observed_mask]
 
+        cloud_norm = np.clip(cloud_scene / 100.0, 0.0, 1.0).astype(np.float32)
+        px_norm = np.clip(np.log1p(np.clip(px_count, a_min=0.0, a_max=None)) / np.log1p(256.0), 0.0, 1.0).astype(
+            np.float32
+        )
+        cloud_norm = np.where(observed_mask, cloud_norm, 1.0).astype(np.float32)
+        px_norm = np.where(observed_mask, px_norm, 0.0).astype(np.float32)
+        reliability = (
+            observed_mask.astype(np.float32)
+            * (1.0 - cloud_norm)
+            * np.sqrt(np.clip(px_norm, a_min=0.0, a_max=1.0))
+        ).astype(np.float32)
+        quality_features = np.stack([reliability, cloud_norm, px_norm], axis=-1).astype(np.float32)
+
         return {
             "features": torch.from_numpy(features),
             "day_of_year": torch.from_numpy(self.day_of_year[idx]).float(),
             "observed_mask": torch.from_numpy(observed_mask),
+            "quality_features": torch.from_numpy(quality_features),
             "label": torch.tensor(int(self.labels[idx]), dtype=torch.long),
             "group_label": torch.tensor(int(self.group_labels[idx]), dtype=torch.long),
             "parcel_id": str(self.parcel_ids[idx]),
@@ -162,12 +194,13 @@ def _required_columns(cfg: DataConfig) -> list[str]:
 
 
 def _mode_or_first(series: pd.Series) -> str:
-    series = series.dropna()
+    series = series.dropna().astype(str).str.strip()
+    series = series[series != ""]
     if series.empty:
         return ""
     mode = series.mode(dropna=True)
     if not mode.empty:
-        return str(mode.iloc[0])
+        return str(sorted(mode.astype(str).tolist())[0])
     return str(series.iloc[0])
 
 
@@ -185,7 +218,29 @@ def load_long_dataframe(cfg: DataConfig) -> pd.DataFrame:
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    df = pd.read_csv(csv_path)
+    header_cols = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    missing = [col for col in _required_columns(cfg) if col not in header_cols]
+    if missing:
+        raise ValueError(
+            f"CSV missing required columns: {missing}. "
+            f"Expected columns include {', '.join(_required_columns(cfg))}."
+        )
+
+    usecols = list(_required_columns(cfg))
+    if cfg.label_group_col in header_cols and cfg.label_group_col not in usecols:
+        usecols.append(cfg.label_group_col)
+
+    str_dtype_cols = [cfg.parcel_id_col, cfg.index_col, cfg.label_col, cfg.tile_col]
+    if cfg.label_group_col in usecols:
+        str_dtype_cols.append(cfg.label_group_col)
+    dtype_map = {col: "string" for col in str_dtype_cols}
+
+    df = pd.read_csv(
+        csv_path,
+        usecols=usecols,
+        dtype=dtype_map,
+        low_memory=False,
+    )
     _validate_input_dataframe(df, cfg)
 
     df[cfg.date_col] = pd.to_datetime(df[cfg.date_col], errors="coerce")
@@ -199,17 +254,34 @@ def load_long_dataframe(cfg: DataConfig) -> pd.DataFrame:
         subset=[cfg.parcel_id_col, cfg.date_col, cfg.index_col, cfg.value_col, cfg.label_col]
     ).copy()
 
-    df[cfg.parcel_id_col] = df[cfg.parcel_id_col].astype(str)
-    df[cfg.index_col] = df[cfg.index_col].astype(str)
-    df[cfg.label_col] = df[cfg.label_col].astype(str)
-    df[cfg.tile_col] = df[cfg.tile_col].astype(str)
+    df[cfg.parcel_id_col] = (
+        df[cfg.parcel_id_col]
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\.0+$", "", regex=True)
+    )
+    df[cfg.index_col] = df[cfg.index_col].astype(str).str.strip().str.upper()
+    df[cfg.label_col] = df[cfg.label_col].astype(str).str.strip()
+    df[cfg.tile_col] = df[cfg.tile_col].astype(str).str.strip()
+    if cfg.label_group_col in df.columns:
+        df[cfg.label_group_col] = df[cfg.label_group_col].astype(str).str.strip()
     df[cfg.value_col] = pd.to_numeric(df[cfg.value_col], errors="coerce")
     df[cfg.px_count_col] = pd.to_numeric(df[cfg.px_count_col], errors="coerce")
     df[cfg.cloud_col] = pd.to_numeric(df[cfg.cloud_col], errors="coerce")
     df = df.dropna(subset=[cfg.value_col]).copy()
+    df = df[
+        (df[cfg.parcel_id_col] != "")
+        & (df[cfg.index_col] != "")
+        & (df[cfg.label_col] != "")
+        & (df[cfg.tile_col] != "")
+    ].copy()
 
     if cfg.index_filter:
-        allowed = set(cfg.index_filter)
+        allowed = {str(x).strip().upper() for x in cfg.index_filter if str(x).strip()}
+        available = set(df[cfg.index_col].dropna().astype(str).unique().tolist())
+        missing = sorted(allowed - available)
+        if missing:
+            LOGGER.warning("Requested indices not found in CSV and will be ignored: %s", ", ".join(missing))
         before = len(df)
         df = df[df[cfg.index_col].isin(allowed)].copy()
         LOGGER.info("Filtered indices: %d -> %d rows", before, len(df))
@@ -467,11 +539,22 @@ def _build_tensor_dataset(df: pd.DataFrame, cfg: DataConfig) -> PreparedDataset:
     )
     pivot = pivot.reindex(columns=feature_names)
 
+    quality = (
+        df.groupby([cfg.parcel_id_col, cfg.date_col], as_index=True)
+        .agg(
+            {
+                cfg.cloud_col: "mean",
+                cfg.px_count_col: "mean",
+            }
+        )
+    )
+
     full_index = pd.MultiIndex.from_product(
         [parcel_ids, time_grid],
         names=[cfg.parcel_id_col, cfg.date_col],
     )
     pivot = pivot.reindex(full_index)
+    quality = quality.reindex(full_index)
 
     n_parcels = len(parcel_ids)
     seq_len = len(time_grid)
@@ -481,6 +564,12 @@ def _build_tensor_dataset(df: pd.DataFrame, cfg: DataConfig) -> PreparedDataset:
     features = (
         pivot.fillna(cfg.fill_value).to_numpy(dtype=np.float32).reshape(n_parcels, seq_len, num_features)
     )
+    cloud_scene = quality[cfg.cloud_col].to_numpy(dtype=np.float32).reshape(n_parcels, seq_len)
+    px_count = quality[cfg.px_count_col].to_numpy(dtype=np.float32).reshape(n_parcels, seq_len)
+    cloud_scene = np.nan_to_num(cloud_scene, nan=100.0, posinf=100.0, neginf=100.0)
+    px_count = np.nan_to_num(px_count, nan=0.0, posinf=0.0, neginf=0.0)
+    cloud_scene = np.clip(cloud_scene, a_min=0.0, a_max=100.0).astype(np.float32)
+    px_count = np.clip(px_count, a_min=0.0, a_max=None).astype(np.float32)
 
     day_vector = np.asarray(time_grid.dayofyear, dtype=np.int16)
     day_of_year = np.tile(day_vector[None, :], (n_parcels, 1))
@@ -544,6 +633,8 @@ def _build_tensor_dataset(df: pd.DataFrame, cfg: DataConfig) -> PreparedDataset:
     features = features[min_obs_mask]
     day_of_year = day_of_year[min_obs_mask]
     observed_mask = observed_mask[min_obs_mask]
+    cloud_scene = cloud_scene[min_obs_mask]
+    px_count = px_count[min_obs_mask]
     labels = labels[min_obs_mask]
     parcel_ids = parcel_ids[min_obs_mask]
     parcel_tiles = parcel_tiles[min_obs_mask]
@@ -556,6 +647,8 @@ def _build_tensor_dataset(df: pd.DataFrame, cfg: DataConfig) -> PreparedDataset:
         features=features.astype(np.float32),
         day_of_year=day_of_year.astype(np.int16),
         observed_mask=observed_mask.astype(bool),
+        cloud_scene=cloud_scene.astype(np.float32),
+        px_count=px_count.astype(np.float32),
         labels=labels.astype(np.int64),
         parcel_ids=parcel_ids.astype(str),
         parcel_tiles=parcel_tiles.astype(str),
@@ -655,11 +748,23 @@ def save_prepared_dataset(prepared: PreparedDataset, path: str | Path) -> None:
 
     splits_json = json.dumps({k: v.tolist() for k, v in prepared.splits.items()})
     has_group_labels = prepared.group_labels is not None and len(prepared.group_label_names) > 0
+    cloud_scene = (
+        prepared.cloud_scene.astype(np.float32)
+        if prepared.cloud_scene is not None
+        else np.full(prepared.observed_mask.shape, 100.0, dtype=np.float32)
+    )
+    px_count = (
+        prepared.px_count.astype(np.float32)
+        if prepared.px_count is not None
+        else np.zeros(prepared.observed_mask.shape, dtype=np.float32)
+    )
     np.savez_compressed(
         save_path,
         features=prepared.features,
         day_of_year=prepared.day_of_year,
         observed_mask=prepared.observed_mask,
+        cloud_scene=cloud_scene,
+        px_count=px_count,
         labels=prepared.labels,
         group_labels=prepared.group_labels if has_group_labels else np.array([], dtype=np.int64),
         parcel_ids=prepared.parcel_ids,
@@ -700,6 +805,16 @@ def load_prepared_dataset(path: str | Path) -> PreparedDataset:
             features=data["features"].astype(np.float32),
             day_of_year=data["day_of_year"].astype(np.int16),
             observed_mask=data["observed_mask"].astype(bool),
+            cloud_scene=(
+                data["cloud_scene"].astype(np.float32)
+                if "cloud_scene" in data.files
+                else np.full(data["observed_mask"].shape, 100.0, dtype=np.float32)
+            ),
+            px_count=(
+                data["px_count"].astype(np.float32)
+                if "px_count" in data.files
+                else np.zeros(data["observed_mask"].shape, dtype=np.float32)
+            ),
             labels=data["labels"].astype(np.int64),
             parcel_ids=data["parcel_ids"].astype(str),
             parcel_tiles=data["parcel_tiles"].astype(str),

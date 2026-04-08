@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -15,6 +17,52 @@ from data import build_dataloaders, prepare_dataset, standardize_prepared_featur
 from evaluate import analyze_errors_by_class, compute_classification_metrics, plot_confusion_matrix
 from model import TemporalTransformerClassifier
 from utils import resolve_device, save_json, setup_logger
+
+
+def configure_hierarchical_constraint_from_metadata(
+    model: TemporalTransformerClassifier,
+    metadata: dict[str, Any],
+    logger,
+) -> None:
+    enabled = bool(metadata.get("hierarchical_constraint", False))
+    compat = metadata.get("class_group_compat")
+    if not enabled or compat is None:
+        return
+
+    try:
+        compat_tensor = torch.tensor(compat, dtype=torch.float32, device=next(model.parameters()).device)
+        model.configure_hierarchical_constraint(
+            class_group_compat=compat_tensor,
+            weight=float(metadata.get("hierarchical_constraint_weight", 1.0)),
+            eps=float(metadata.get("hierarchical_constraint_eps", 1.0e-6)),
+            enabled=True,
+        )
+        logger.info(
+            "Applied hierarchical constraint for checkpoint model (weight=%.3f).",
+            float(metadata.get("hierarchical_constraint_weight", 1.0)),
+        )
+    except Exception as exc:
+        logger.warning("Could not apply hierarchical constraint from metadata: %s", exc)
+
+
+def checkpoint_uses_reliability(checkpoint: dict[str, Any]) -> bool:
+    metadata = checkpoint.get("metadata", {})
+    if isinstance(metadata, dict) and "reliability_aware" in metadata:
+        return bool(metadata.get("reliability_aware", False))
+
+    state_dict = checkpoint.get("model_state_dict", {})
+    if not isinstance(state_dict, dict):
+        return False
+
+    for raw_key in state_dict.keys():
+        key = str(raw_key)
+        if key.startswith("module."):
+            key = key[len("module.") :]
+        if key.startswith("backbone."):
+            key = key[len("backbone.") :]
+        if key.startswith("reliability_proj.") or key == "reliability_gate_logit":
+            return True
+    return False
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +85,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", type=str, choices=["train", "val", "test"], default="test")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument(
+        "--ensemble-weighting",
+        type=str,
+        choices=["uniform", "val_macro_f1"],
+        default="uniform",
+        help="How to weight checkpoints in the ensemble.",
+    )
+    parser.add_argument(
+        "--weight-power",
+        type=float,
+        default=1.0,
+        help="Exponent applied to non-uniform weights before normalization.",
+    )
 
     parser.add_argument("--csv-path", type=str, default=None, help="CSV input path (if not using NPZ).")
     parser.add_argument("--prepared-npz", type=str, default=None, help="Prepared NPZ input path.")
@@ -136,14 +197,86 @@ def load_config(args: argparse.Namespace, checkpoints: list[Path]) -> tuple[Any,
     return cfg, config_path
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(x):
+        return None
+    return x
+
+
+def resolve_model_scores(
+    checkpoint_paths: list[Path],
+    checkpoints: list[dict[str, Any]],
+    logger,
+) -> list[float]:
+    scores: list[float] = []
+    for ckpt_path, checkpoint in zip(checkpoint_paths, checkpoints):
+        score: Optional[float] = None
+        val_metrics_path = ckpt_path.parent / "val_metrics.json"
+        if val_metrics_path.exists():
+            try:
+                with val_metrics_path.open("r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                score = _safe_float(payload.get("f1_macro"))
+            except Exception as exc:
+                logger.warning("Could not read %s: %s", val_metrics_path, exc)
+        if score is None:
+            score = _safe_float(checkpoint.get("best_metric"))
+        if score is None:
+            logger.warning("No usable validation score found for %s; defaulting to 0.", ckpt_path)
+            score = 0.0
+        scores.append(max(0.0, score))
+    return scores
+
+
+def build_model_weights(
+    checkpoint_paths: list[Path],
+    checkpoints: list[dict[str, Any]],
+    weighting: str,
+    weight_power: float,
+    logger,
+) -> tuple[np.ndarray, list[float]]:
+    n_models = len(checkpoint_paths)
+    if n_models == 0:
+        raise ValueError("No checkpoints available to build ensemble weights.")
+
+    if weighting == "uniform":
+        return np.full((n_models,), 1.0 / float(n_models), dtype=np.float32), [1.0] * n_models
+
+    raw_scores = resolve_model_scores(checkpoint_paths=checkpoint_paths, checkpoints=checkpoints, logger=logger)
+    scores = np.asarray(raw_scores, dtype=np.float64)
+    scores = np.clip(scores, a_min=0.0, a_max=None)
+
+    if weight_power <= 0:
+        raise ValueError("--weight-power must be > 0.")
+    if weight_power != 1.0:
+        scores = np.power(scores, weight_power)
+
+    total = float(scores.sum())
+    if total <= 0:
+        logger.warning("All model scores are zero; falling back to uniform ensemble weights.")
+        return np.full((n_models,), 1.0 / float(n_models), dtype=np.float32), raw_scores
+
+    weights = (scores / total).astype(np.float32)
+    return weights, raw_scores
+
+
 @torch.no_grad()
 def predict_ensemble(
     models: list[torch.nn.Module],
+    model_weights: np.ndarray,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
 ) -> dict[str, np.ndarray]:
     if len(models) == 0:
         raise ValueError("No models were loaded for ensemble prediction.")
+    if model_weights.shape[0] != len(models):
+        raise ValueError("model_weights size must match number of models.")
 
     for model in models:
         model.eval()
@@ -156,22 +289,23 @@ def predict_ensemble(
         features = batch["features"].to(device=device, dtype=torch.float32)
         day_of_year = batch["day_of_year"].to(device=device, dtype=torch.float32)
         observed_mask = batch["observed_mask"].to(device=device, dtype=torch.bool)
+        quality_features = batch["quality_features"].to(device=device, dtype=torch.float32)
         labels = batch["label"].to(device=device, dtype=torch.long)
 
         logits_sum: Optional[torch.Tensor] = None
-        for model in models:
+        for i, model in enumerate(models):
             outputs = model(
                 features=features,
                 day_of_year=day_of_year,
                 observed_mask=observed_mask,
+                quality_features=quality_features,
                 return_attention=False,
             )
-            logits = outputs["logits"]
+            logits = outputs["logits"] * float(model_weights[i])
             logits_sum = logits if logits_sum is None else (logits_sum + logits)
 
         assert logits_sum is not None
-        logits_avg = logits_sum / float(len(models))
-        all_logits.append(logits_avg.cpu().numpy())
+        all_logits.append(logits_sum.cpu().numpy())
         all_labels.append(labels.cpu().numpy())
         all_parcel_ids.extend(batch["parcel_id"])
 
@@ -205,6 +339,8 @@ def main() -> None:
             "split": args.split,
             "device": args.device,
             "batch_size": args.batch_size,
+            "ensemble_weighting": args.ensemble_weighting,
+            "weight_power": args.weight_power,
             "config": cfg.to_dict(),
         },
         output_dir / "ensemble_config.json",
@@ -237,6 +373,7 @@ def main() -> None:
     dataloader = dataloaders[args.split]
 
     models: list[torch.nn.Module] = []
+    loaded_checkpoints: list[dict[str, Any]] = []
     for ckpt_path in checkpoint_paths:
         try:
             checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -244,11 +381,13 @@ def main() -> None:
             checkpoint = torch.load(ckpt_path, map_location=device)
 
         metadata = checkpoint.get("metadata", {})
+        uses_reliability = checkpoint_uses_reliability(checkpoint)
         num_group_classes = int(metadata.get("num_group_classes", 0) or 0)
+        model_cfg = replace(cfg.model, reliability_aware=uses_reliability)
         model = TemporalTransformerClassifier(
             input_dim=prepared.num_features,
             num_classes=prepared.num_classes,
-            cfg=cfg.model,
+            cfg=model_cfg,
             num_group_classes=num_group_classes,
         ).to(device)
         label_names_meta = metadata.get("label_names")
@@ -259,9 +398,31 @@ def main() -> None:
             )
 
         model.load_state_dict(checkpoint["model_state_dict"])
+        configure_hierarchical_constraint_from_metadata(model=model, metadata=metadata, logger=logger)
         models.append(model)
+        loaded_checkpoints.append(checkpoint)
 
-    predictions = predict_ensemble(models=models, dataloader=dataloader, device=device)
+    model_weights, raw_scores = build_model_weights(
+        checkpoint_paths=checkpoint_paths,
+        checkpoints=loaded_checkpoints,
+        weighting=args.ensemble_weighting,
+        weight_power=args.weight_power,
+        logger=logger,
+    )
+    for ckpt_path, raw_score, w in zip(checkpoint_paths, raw_scores, model_weights):
+        logger.info(
+            "Ensemble weight | checkpoint=%s | raw_score=%.6f | weight=%.6f",
+            ckpt_path,
+            float(raw_score),
+            float(w),
+        )
+
+    predictions = predict_ensemble(
+        models=models,
+        model_weights=model_weights,
+        dataloader=dataloader,
+        device=device,
+    )
     metrics = compute_classification_metrics(
         y_true=predictions["labels"],
         y_pred=predictions["preds"],
@@ -274,6 +435,8 @@ def main() -> None:
 
     metrics_payload = {
         "accuracy": metrics["accuracy"],
+        "recall_macro": metrics["recall_macro"],
+        "recall_weighted": metrics["recall_weighted"],
         "f1_macro": metrics["f1_macro"],
         "f1_weighted": metrics["f1_weighted"],
         "classification_report": metrics["classification_report_dict"],
@@ -281,6 +444,10 @@ def main() -> None:
         "confusion_matrix": metrics["confusion_matrix"].tolist(),
         "n_models": len(models),
         "checkpoints": [str(p) for p in checkpoint_paths],
+        "ensemble_weighting": args.ensemble_weighting,
+        "weight_power": args.weight_power,
+        "model_weights": [float(x) for x in model_weights.tolist()],
+        "model_raw_scores": [float(x) for x in raw_scores],
     }
     save_json(metrics_payload, output_dir / f"{args.split}_ensemble_metrics.json")
     with (output_dir / f"{args.split}_ensemble_classification_report.txt").open("w", encoding="utf-8") as f:
@@ -313,10 +480,11 @@ def main() -> None:
     pred_df.to_csv(output_dir / f"{args.split}_ensemble_predictions.csv", index=False)
 
     logger.info(
-        "ENSEMBLE %s | n_models=%d | accuracy=%.4f macro_f1=%.4f weighted_f1=%.4f",
+        "ENSEMBLE %s | n_models=%d | accuracy=%.4f recall_macro=%.4f macro_f1=%.4f weighted_f1=%.4f",
         args.split.upper(),
         len(models),
         metrics["accuracy"],
+        metrics["recall_macro"],
         metrics["f1_macro"],
         metrics["f1_weighted"],
     )

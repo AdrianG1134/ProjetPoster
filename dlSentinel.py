@@ -1,4 +1,5 @@
 import os
+import shutil
 from collections import defaultdict
 from datetime import datetime, date, timedelta
 
@@ -31,19 +32,40 @@ START, END = "2024-01-01", "2024-12-31"
 
 # On réduit à 40% car au-delà, les scènes sont peu utiles
 # et causent des erreurs réseau/lecture pour rien.
-MAX_CLOUD = 40
+# Seuil nuage global pour recuperer assez d'observations annuelles.
+# Les modeles en aval peuvent ensuite filtrer plus strictement (ex. cloud<=40).
+MAX_CLOUD = 80
 
 # Fenêtrage temporel (aligné revisite)
 WINDOW_DAYS = 5          # 5 jours recommandé
 TOP_K_PER_WINDOW = 1     # 1 scène par fenêtre (tu peux mettre 2 si tu veux plus dense)
 
 # Bandes nécessaires + SCL (masque nuages)
-# Indices: NDVI (B04,B08), NDMI (B08,B11), NDWI (B03,B08), EVI (B02,B04,B08)
+# Indices de base: NDVI (B04,B08), NDMI (B08,B11), NDWI (B03,B08), EVI (B02,B04,B08)
 BANDS = ["B02", "B03", "B04", "B08", "B11", "SCL"]
+
+# Indices exportés dans le CSV long.
+# On garde les 4 historiques + des indices supplémentaires
+# calculables avec B02/B03/B04/B08/B11.
+INDEX_NAMES = [
+    "NDVI",
+    "NDMI",
+    "NDWI",
+    "EVI",
+    "GNDVI",
+    "SAVI",
+    "OSAVI",
+    "MSAVI",
+    "MNDWI",
+    "ARVI",
+    "BSI",
+]
 
 IDX_NODATA = -9999.0
 PAD_DEG = 0.0
 MIN_PX_COUNT = 10   # filtrage qualité (0 = tout garder)
+# Supprime les rasters temporaires de chaque scène pour limiter l'espace disque.
+KEEP_SCENE_RASTERS = False
 
 # SCL classes à masquer (nuages/ombres/neige/nodata)
 # SCL classes (ESA):
@@ -346,15 +368,42 @@ def compute_indices_with_scl(band_paths, out_dir, nodata_val=IDX_NODATA):
     ndmi = (nir - swir) / (nir + swir + 1e-6)
     ndwi = (green - nir) / (green + nir + 1e-6)
     evi = 2.5 * (nir - red) / (nir + 6.0 * red - 7.5 * blue + 1.0 + 1e-6)
+    gndvi = (nir - green) / (nir + green + 1e-6)
+    savi = 1.5 * (nir - red) / (nir + red + 0.5 + 1e-6)
+    osavi = 1.16 * (nir - red) / (nir + red + 0.16 + 1e-6)
+    msavi_root = np.maximum((2.0 * nir + 1.0) ** 2 - 8.0 * (nir - red), 0.0)
+    msavi = 0.5 * ((2.0 * nir + 1.0) - np.sqrt(msavi_root))
+    mndwi = (green - swir) / (green + swir + 1e-6)
+    arvi = (nir - (2.0 * red - blue)) / (nir + (2.0 * red - blue) + 1e-6)
+    bsi = ((swir + red) - (nir + blue)) / ((swir + red) + (nir + blue) + 1e-6)
 
-    for a in (ndvi, ndmi, ndwi, evi):
+    # nodata
+    for a in (ndvi, ndmi, ndwi, evi, gndvi, savi, osavi, msavi, mndwi, arvi, bsi):
         a[mmask] = nodata_val
 
     out = {}
-    out["NDVI"] = write_index(os.path.join(out_dir, "NDVI.tif"), b08, ndvi, nodata_val)
-    out["NDMI"] = write_index(os.path.join(out_dir, "NDMI.tif"), b08, ndmi, nodata_val)
-    out["NDWI"] = write_index(os.path.join(out_dir, "NDWI.tif"), b08, ndwi, nodata_val)
-    out["EVI"] = write_index(os.path.join(out_dir, "EVI.tif"), b08, evi, nodata_val)
+    all_idx = {
+        "NDVI": ndvi,
+        "NDMI": ndmi,
+        "NDWI": ndwi,
+        "EVI": evi,
+        "GNDVI": gndvi,
+        "SAVI": savi,
+        "OSAVI": osavi,
+        "MSAVI": msavi,
+        "MNDWI": mndwi,
+        "ARVI": arvi,
+        "BSI": bsi,
+    }
+    for idx_name in INDEX_NAMES:
+        if idx_name not in all_idx:
+            continue
+        out[idx_name] = write_index(
+            os.path.join(out_dir, f"{idx_name}.tif"),
+            b08,
+            all_idx[idx_name],
+            nodata_val,
+        )
     return out
 
 
@@ -466,20 +515,29 @@ for tile, its in selected.items():
             if not os.path.exists(out_path):
                 try:
                     p = download_crop_band(it.assets[b].href, out_path, crop_bbox)
-                    if p is None:
-                        ok = False
-                        break
                 except Exception as e:
                     print(f"  ❌ Erreur téléchargement/lecture pour {item_id} | bande {b} : {e}")
+                    ok = False
+                    break
+                if p is None:
                     ok = False
                     break
 
             band_paths[b] = out_path
 
         if not ok:
+            if not KEEP_SCENE_RASTERS:
+                shutil.rmtree(out_dir, ignore_errors=True)
             continue
 
-        idx_paths = compute_indices_with_scl(band_paths, out_dir, nodata_val=IDX_NODATA)
+        # indices + mask nuages via SCL
+        try:
+            idx_paths = compute_indices_with_scl(band_paths, out_dir, nodata_val=IDX_NODATA)
+        except Exception as e:
+            print(f"  ⚠️ Échec calcul indices ({tile} {d}): {e} -> skip scène")
+            if not KEEP_SCENE_RASTERS:
+                shutil.rmtree(out_dir, ignore_errors=True)
+            continue
         print("  Indices:", ", ".join(idx_paths.keys()))
 
         with rasterio.open(band_paths["B08"]) as src:
@@ -495,11 +553,13 @@ for tile, its in selected.items():
         )
 
         if MIN_PX_COUNT > 0:
-            df_stats = df_stats[df_stats["ndvi_count"].fillna(0) >= MIN_PX_COUNT].copy()
+            ref_col = "ndvi_count" if "ndvi_count" in df_stats.columns else f"{INDEX_NAMES[0].lower()}_count"
+            if ref_col in df_stats.columns:
+                df_stats = df_stats[df_stats[ref_col].fillna(0) >= MIN_PX_COUNT].copy()
 
         for _, r in df_stats.iterrows():
             pid = r[ID_COL]
-            for idx_name in ["NDVI", "NDMI", "NDWI", "EVI"]:
+            for idx_name in idx_paths.keys():
                 rows.append({
                     "date": d,
                     "tile": tile,
@@ -510,6 +570,8 @@ for tile, its in selected.items():
                     "cloud_scene": cloud,
                 })
 
+        if not KEEP_SCENE_RASTERS:
+            shutil.rmtree(out_dir, ignore_errors=True)
 
 # =========================
 # 8) Export CSV final

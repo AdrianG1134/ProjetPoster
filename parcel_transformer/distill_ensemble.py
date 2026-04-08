@@ -5,7 +5,7 @@ import glob
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -268,11 +268,58 @@ def load_teacher_model_cfg(teacher_checkpoint: Path, fallback_cfg: ExperimentCon
     return fallback_cfg.model.__class__(**payload.get("model", {}))
 
 
+def configure_hierarchical_constraint_from_metadata(
+    model: TemporalTransformerClassifier,
+    metadata: dict[str, Any],
+    logger,
+) -> None:
+    enabled = bool(metadata.get("hierarchical_constraint", False))
+    compat = metadata.get("class_group_compat")
+    if not enabled or compat is None:
+        return
+
+    try:
+        compat_tensor = torch.tensor(compat, dtype=torch.float32, device=next(model.parameters()).device)
+        model.configure_hierarchical_constraint(
+            class_group_compat=compat_tensor,
+            weight=float(metadata.get("hierarchical_constraint_weight", 1.0)),
+            eps=float(metadata.get("hierarchical_constraint_eps", 1.0e-6)),
+            enabled=True,
+        )
+        logger.info(
+            "Applied hierarchical constraint for teacher model (weight=%.3f).",
+            float(metadata.get("hierarchical_constraint_weight", 1.0)),
+        )
+    except Exception as exc:
+        logger.warning("Could not apply hierarchical constraint for teacher model: %s", exc)
+
+
+def checkpoint_uses_reliability(checkpoint: dict[str, Any]) -> bool:
+    metadata = checkpoint.get("metadata", {})
+    if isinstance(metadata, dict) and "reliability_aware" in metadata:
+        return bool(metadata.get("reliability_aware", False))
+
+    state_dict = checkpoint.get("model_state_dict", {})
+    if not isinstance(state_dict, dict):
+        return False
+
+    for raw_key in state_dict.keys():
+        key = str(raw_key)
+        if key.startswith("module."):
+            key = key[len("module.") :]
+        if key.startswith("backbone."):
+            key = key[len("backbone.") :]
+        if key.startswith("reliability_proj.") or key == "reliability_gate_logit":
+            return True
+    return False
+
+
 def load_teachers(
     teacher_checkpoints: list[Path],
     cfg: ExperimentConfig,
     prepared,
     device: torch.device,
+    logger,
 ) -> list[nn.Module]:
     teachers: list[nn.Module] = []
     for checkpoint_path in teacher_checkpoints:
@@ -290,6 +337,11 @@ def load_teachers(
             )
 
         teacher_model_cfg = load_teacher_model_cfg(checkpoint_path, cfg)
+        teacher_model_cfg.reliability_aware = bool(
+            getattr(teacher_model_cfg, "reliability_aware", False) or checkpoint_uses_reliability(checkpoint)
+        )
+        if teacher_model_cfg.reliability_aware:
+            cfg.model.reliability_aware = True
         teacher_num_group_classes = int(metadata.get("num_group_classes", 0) or 0)
 
         teacher = TemporalTransformerClassifier(
@@ -299,6 +351,7 @@ def load_teachers(
             num_group_classes=teacher_num_group_classes,
         ).to(device)
         teacher.load_state_dict(checkpoint["model_state_dict"])
+        configure_hierarchical_constraint_from_metadata(model=teacher, metadata=metadata, logger=logger)
         teacher.eval()
         for param in teacher.parameters():
             param.requires_grad_(False)
@@ -334,6 +387,7 @@ def run_distill_train_epoch(
         features = batch["features"].to(device=device, dtype=torch.float32)
         day_of_year = batch["day_of_year"].to(device=device, dtype=torch.float32)
         observed_mask = batch["observed_mask"].to(device=device, dtype=torch.bool)
+        quality_features = batch["quality_features"].to(device=device, dtype=torch.float32)
         labels = batch["label"].to(device=device, dtype=torch.long)
 
         optimizer.zero_grad(set_to_none=True)
@@ -345,6 +399,7 @@ def run_distill_train_epoch(
                     features=features,
                     day_of_year=day_of_year,
                     observed_mask=observed_mask,
+                    quality_features=quality_features,
                     return_attention=False,
                 )
                 logits_t = outputs_t["logits"]
@@ -356,6 +411,7 @@ def run_distill_train_epoch(
             features=features,
             day_of_year=day_of_year,
             observed_mask=observed_mask,
+            quality_features=quality_features,
             return_attention=False,
         )
         student_logits = outputs_s["logits"]
@@ -410,12 +466,14 @@ def run_eval_epoch(
         features = batch["features"].to(device=device, dtype=torch.float32)
         day_of_year = batch["day_of_year"].to(device=device, dtype=torch.float32)
         observed_mask = batch["observed_mask"].to(device=device, dtype=torch.bool)
+        quality_features = batch["quality_features"].to(device=device, dtype=torch.float32)
         labels = batch["label"].to(device=device, dtype=torch.long)
 
         outputs = model(
             features=features,
             day_of_year=day_of_year,
             observed_mask=observed_mask,
+            quality_features=quality_features,
             return_attention=False,
         )
         logits = outputs["logits"]
@@ -484,7 +542,6 @@ def main() -> None:
     args = parse_args()
     teacher_checkpoints = resolve_teacher_checkpoints(args)
     cfg, config_path = load_base_config(args, teacher_checkpoints)
-    student_model_cfg = build_student_model_cfg(cfg, args)
 
     if cfg.train.epochs <= 0:
         raise ValueError("epochs must be > 0.")
@@ -583,7 +640,9 @@ def main() -> None:
         cfg=cfg,
         prepared=prepared,
         device=device,
+        logger=logger,
     )
+    student_model_cfg = build_student_model_cfg(cfg, args)
 
     student = TemporalTransformerClassifier(
         input_dim=prepared.num_features,
@@ -692,6 +751,7 @@ def main() -> None:
                     "label_names": prepared.label_names,
                     "feature_names": prepared.feature_names,
                     "pooling": student_model_cfg.pooling,
+                    "reliability_aware": bool(student_model_cfg.reliability_aware),
                     "distillation_temperature": args.temperature,
                     "distillation_hard_label_weight": args.hard_label_weight,
                     "teacher_checkpoints": [str(p) for p in teacher_checkpoints],
